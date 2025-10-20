@@ -8,7 +8,6 @@ on:
 jobs:
   deploy:
     runs-on: ubuntu-latest
-
     env:
       FIREBASE_PROJECT_ID: ${{ secrets.FIREBASE_PROJECT_ID }}
       OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
@@ -21,10 +20,7 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: '20'
-          # ⚠️ lockfile이 없으니 캐시 미사용
-          # cache: 'npm'  ← 제거
 
-      # Google 인증 (서비스 계정)
       - name: Authenticate to Google Cloud
         uses: google-github-actions/auth@v2
         with:
@@ -33,10 +29,20 @@ jobs:
       - name: Setup gcloud SDK
         uses: google-github-actions/setup-gcloud@v2
 
+      # ✅ 프로젝트 컨텍스트 고정 + 검증
+      - name: Set gcloud project (hard set)
+        run: gcloud config set project "${FIREBASE_PROJECT_ID}"
+
+      - name: Verify project & principal
+        run: |
+          gcloud config list
+          gcloud auth list
+          gcloud projects describe "${FIREBASE_PROJECT_ID}" --format="value(projectId,projectNumber)"
+
       - name: Install Firebase CLI
         run: npm i -g firebase-tools
 
-      # (중요) 필요한 API 활성화 — 403 방지
+      # ▶︎ 권한 되면 유지, 아니면 콘솔에서 Enable 후 이 스텝 제거/완화( || true )
       - name: Enable required Google APIs
         run: |
           gcloud services enable \
@@ -49,25 +55,21 @@ jobs:
             storage.googleapis.com \
             --project "${FIREBASE_PROJECT_ID}"
 
-      # .firebaserc placeholder 치환(있을 때만)
       - name: Patch .firebaserc (optional)
         run: |
           if [ -f ".firebaserc" ]; then
             sed -i "s/FIREBASE_PROJECT_ID_PLACEHOLDER/${FIREBASE_PROJECT_ID}/g" .firebaserc || true
           fi
 
-      # Firestore 규칙 배포
       - name: Deploy Firestore Rules
         run: firebase deploy --only firestore:rules --project "${FIREBASE_PROJECT_ID}"
 
-      # Functions Secret 설정/갱신
       - name: Set Functions Secret (OPENAI_API_KEY)
         run: |
           firebase functions:secrets:set OPENAI_API_KEY \
             --project "${FIREBASE_PROJECT_ID}" \
             --data "${OPENAI_API_KEY}"
 
-      # Functions 빌드 & 배포
       - name: Install deps (functions)
         working-directory: functions
         run: |
@@ -80,7 +82,6 @@ jobs:
       - name: Deploy Functions
         run: firebase deploy --only functions --project "${FIREBASE_PROJECT_ID}"
 
-      # 프론트 빌드 (Vite 기본 outDir=dist)
       - name: Install deps (web)
         run: |
           if [ -f package-lock.json ]; then npm ci; else npm install; fi
@@ -88,6 +89,5 @@ jobs:
       - name: Build Web
         run: npm run build
 
-      # Hosting 배포 (firebase.json의 "public"이 dist 인지 확인!)
       - name: Deploy Hosting
         run: firebase deploy --only hosting --project "${FIREBASE_PROJECT_ID}"
