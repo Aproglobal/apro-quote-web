@@ -1,5 +1,4 @@
-# .github/workflows/deploy.yml
-name: Deploy to Firebase (Hosting + Functions + Rules)
+name: Firebase Deploy (No Local, SA Only)
 
 on:
   push:
@@ -14,23 +13,100 @@ permissions:
   contents: read
 
 jobs:
+  # 1) GitHub에서 바로 권한/API 부트스트랩 (Owner SA로 실행)
+  bootstrap:
+    runs-on: ubuntu-latest
+    env:
+      PROJECT_ID: ${{ secrets.FIREBASE_PROJECT_ID }}
+      DEPLOY_SA: github-deployer@${{ secrets.FIREBASE_PROJECT_ID }}.iam.gserviceaccount.com
+    steps:
+      - name: Auth as BOOTSTRAP(OWNER SA)
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_BOOTSTRAP_SA_KEY }}
+          create_credentials_file: true
+          export_environment_variables: true
+
+      - name: Setup gcloud
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Enable required APIs (one-time)
+        run: |
+          gcloud services enable \
+            firestore.googleapis.com \
+            firebaserules.googleapis.com \
+            cloudfunctions.googleapis.com \
+            cloudbuild.googleapis.com \
+            artifactregistry.googleapis.com \
+            secretmanager.googleapis.com \
+            storage.googleapis.com \
+            --project "${PROJECT_ID}"
+
+      - name: Compute project number
+        id: vars
+        run: |
+          PN=$(gcloud projects describe "${PROJECT_ID}" --format='value(projectNumber)')
+          echo "PN=${PN}" >> $GITHUB_OUTPUT
+
+      - name: Grant minimal roles to DEPLOY SA
+        run: |
+          SA="${DEPLOY_SA}"
+          PROJECT_ID="${{ env.PROJECT_ID }}"
+          PN="${{ steps.vars.outputs.PN }}"
+          RUNTIME_SA1="${PROJECT_ID}@appspot.gserviceaccount.com"
+          RUNTIME_SA2="${PN}-compute@developer.gserviceaccount.com"
+          CLOUDBUILD_SA="${PN}@cloudbuild.gserviceaccount.com"
+
+          # View / Service Usage (조회 권한)
+          gcloud projects add-iam-policy-binding "${PROJECT_ID}" --member="serviceAccount:${SA}" --role="roles/viewer"
+          gcloud projects add-iam-policy-binding "${PROJECT_ID}" --member="serviceAccount:${SA}" --role="roles/serviceusage.serviceUsageViewer"
+
+          # Firebase Hosting / Rules
+          gcloud projects add-iam-policy-binding "${PROJECT_ID}" --member="serviceAccount:${SA}" --role="roles/firebasehosting.admin"
+          gcloud projects add-iam-policy-binding "${PROJECT_ID}" --member="serviceAccount:${SA}" --role="roles/firebaserules.admin"
+
+          # Functions Gen2 배포 스택
+          gcloud projects add-iam-policy-binding "${PROJECT_ID}" --member="serviceAccount:${SA}" --role="roles/cloudfunctions.developer"
+          gcloud projects add-iam-policy-binding "${PROJECT_ID}" --member="serviceAccount:${SA}" --role="roles/run.admin"
+          gcloud projects add-iam-policy-binding "${PROJECT_ID}" --member="serviceAccount:${SA}" --role="roles/artifactregistry.writer"
+          gcloud projects add-iam-policy-binding "${PROJECT_ID}" --member="serviceAccount:${SA}" --role="roles/cloudbuild.builds.editor"
+
+          # 런타임 SA 사용 권한 (Functions/Cloud Run 실행 서비스계정)
+          gcloud iam service-accounts add-iam-policy-binding "${RUNTIME_SA1}" \
+            --member="serviceAccount:${SA}" --role="roles/iam.serviceAccountUser" --project "${PROJECT_ID}" || true
+          gcloud iam service-accounts add-iam-policy-binding "${RUNTIME_SA2}" \
+            --member="serviceAccount:${SA}" --role="roles/iam.serviceAccountUser" --project "${PROJECT_ID}" || true
+
+          # Cloud Build SA도 런타임 SA 사용 가능(환경에 따라 필요)
+          gcloud iam service-accounts add-iam-policy-binding "${RUNTIME_SA1}" \
+            --member="serviceAccount:${CLOUDBUILD_SA}" --role="roles/iam.serviceAccountUser" --project "${PROJECT_ID}" || true
+          gcloud iam service-accounts add-iam-policy-binding "${RUNTIME_SA2}" \
+            --member="serviceAccount:${CLOUDBUILD_SA}" --role="roles/iam.serviceAccountUser" --project "${PROJECT_ID}" || true
+
+  # 2) 실제 배포 (배포용 SA로 Firebase CLI 인증) — gcloud 불필요
   deploy:
+    needs: [bootstrap]
     runs-on: ubuntu-latest
     env:
       FIREBASE_PROJECT_ID: ${{ secrets.FIREBASE_PROJECT_ID }}
       OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # ▶ setup-node: 캐시는 별도 actions/cache로 처리 (lock 없으면 실패 방지)
+      - name: Auth as DEPLOY SA (ADC for Firebase CLI)
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+          create_credentials_file: true
+          export_environment_variables: true
+
       - name: Setup Node
         uses: actions/setup-node@v4
         with:
           node-version: 20
 
-      # ── Optional Caches (lock 있을 때만) ──────────────────────────────────────
+      # Optional caches (lock 있을 때만)
       - name: Cache root node_modules
         if: ${{ hashFiles('package-lock.json') != '' }}
         uses: actions/cache@v4
@@ -48,64 +124,11 @@ jobs:
           key: node-func-${{ runner.os }}-20-${{ hashFiles('functions/package-lock.json') }}
           restore-keys: |
             node-func-${{ runner.os }}-20-
-      # ─────────────────────────────────────────────────────────────────────────
-
-      - name: Authenticate to Google Cloud
-        uses: google-github-actions/auth@v2
-        with:
-          credentials_json: ${{ secrets.GCP_SA_KEY }}
-          create_credentials_file: true
-          export_environment_variables: true
-
-      - name: Setup gcloud SDK
-        uses: google-github-actions/setup-gcloud@v2
-
-      # ✅ 권한 문제 시 파이프라인이 멈추지 않도록 non-blocking
-      - name: Set gcloud project (hard set)
-        run: gcloud config set project "${FIREBASE_PROJECT_ID}" || true
-
-      - name: Verify project & principal (non-blocking)
-        run: |
-          gcloud config list
-          gcloud auth list
-          gcloud projects describe "${FIREBASE_PROJECT_ID}" --format="value(projectId,projectNumber)" || true
 
       - name: Install Firebase CLI
         run: npm i -g firebase-tools@latest
 
-      # ▶ API Enable은 콘솔 1회 권장. 필요 시 유지하되 실패해도 진행.
-      - name: Enable required Google APIs (optional)
-        run: |
-          gcloud services enable \
-            firestore.googleapis.com \
-            firebaserules.googleapis.com \
-            cloudfunctions.googleapis.com \
-            cloudbuild.googleapis.com \
-            artifactregistry.googleapis.com \
-            secretmanager.googleapis.com \
-            storage.googleapis.com \
-            --project "${FIREBASE_PROJECT_ID}" || true
-
-      - name: Patch .firebaserc (optional)
-        run: |
-          if [ -f ".firebaserc" ]; then
-            sed -i "s/FIREBASE_PROJECT_ID_PLACEHOLDER/${FIREBASE_PROJECT_ID}/g" .firebaserc || true
-          fi
-
-      - name: Deploy Firestore Rules
-        env:
-          GOOGLE_APPLICATION_CREDENTIALS: ${{ env.GOOGLE_GHA_CREDS_PATH }}
-        run: firebase deploy --only firestore:rules --project "${FIREBASE_PROJECT_ID}"
-
-      # ⚠️ 매 실행마다 새 비전 생성될 수 있음. 필요 없으면 주석 처리.
-      - name: Set Functions Secret (OPENAI_API_KEY)
-        env:
-          GOOGLE_APPLICATION_CREDENTIALS: ${{ env.GOOGLE_GHA_CREDS_PATH }}
-        run: |
-          firebase functions:secrets:set OPENAI_API_KEY \
-            --project "${FIREBASE_PROJECT_ID}" \
-            --data "${OPENAI_API_KEY}"
-
+      # Functions
       - name: Install deps (functions)
         working-directory: functions
         run: |
@@ -115,11 +138,18 @@ jobs:
         working-directory: functions
         run: npm run build
 
-      - name: Deploy Functions
-        env:
-          GOOGLE_APPLICATION_CREDENTIALS: ${{ env.GOOGLE_GHA_CREDS_PATH }}
-        run: firebase deploy --only functions --project "${FIREBASE_PROJECT_ID}"
+      # (선택) Functions Secret 주입 — 매번 새 버전 생성됨. 필요 없으면 주석 처리.
+      - name: Set Functions Secret (OPENAI_API_KEY)
+        if: ${{ env.OPENAI_API_KEY != '' }}
+        run: |
+          firebase functions:secrets:set OPENAI_API_KEY \
+            --project "${FIREBASE_PROJECT_ID}" \
+            --data "${OPENAI_API_KEY}"
 
+      - name: Deploy Firestore Rules
+        run: firebase deploy --only firestore:rules --project "${FIREBASE_PROJECT_ID}"
+
+      # Web
       - name: Install deps (web)
         run: |
           if [ -f package-lock.json ]; then npm ci; else npm install; fi
@@ -127,7 +157,8 @@ jobs:
       - name: Build Web
         run: npm run build
 
+      - name: Deploy Functions
+        run: firebase deploy --only functions --project "${FIREBASE_PROJECT_ID}"
+
       - name: Deploy Hosting
-        env:
-          GOOGLE_APPLICATION_CREDENTIALS: ${{ env.GOOGLE_GHA_CREDS_PATH }}
         run: firebase deploy --only hosting --project "${FIREBASE_PROJECT_ID}"
