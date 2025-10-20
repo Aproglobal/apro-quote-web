@@ -24,11 +24,31 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      # ▶ setup-node: 캐시는 별도 actions/cache로 처리 (lock 없으면 실패 방지)
       - name: Setup Node
         uses: actions/setup-node@v4
         with:
           node-version: 20
-          cache: npm
+
+      # ── Optional Caches (lock 있을 때만) ──────────────────────────────────────
+      - name: Cache root node_modules
+        if: ${{ hashFiles('package-lock.json') != '' }}
+        uses: actions/cache@v4
+        with:
+          path: node_modules
+          key: node-${{ runner.os }}-20-${{ hashFiles('package-lock.json') }}
+          restore-keys: |
+            node-${{ runner.os }}-20-
+
+      - name: Cache functions node_modules
+        if: ${{ hashFiles('functions/package-lock.json') != '' }}
+        uses: actions/cache@v4
+        with:
+          path: functions/node_modules
+          key: node-func-${{ runner.os }}-20-${{ hashFiles('functions/package-lock.json') }}
+          restore-keys: |
+            node-func-${{ runner.os }}-20-
+      # ─────────────────────────────────────────────────────────────────────────
 
       - name: Authenticate to Google Cloud
         uses: google-github-actions/auth@v2
@@ -40,7 +60,7 @@ jobs:
       - name: Setup gcloud SDK
         uses: google-github-actions/setup-gcloud@v2
 
-      # ✅ 프로젝트 컨텍스트 고정(권한 없으면 실패하지 않도록 || true)
+      # ✅ 권한 문제 시 파이프라인이 멈추지 않도록 non-blocking
       - name: Set gcloud project (hard set)
         run: gcloud config set project "${FIREBASE_PROJECT_ID}" || true
 
@@ -53,7 +73,7 @@ jobs:
       - name: Install Firebase CLI
         run: npm i -g firebase-tools@latest
 
-      # ▶︎ API Enable은 1회 콘솔에서 하는 것을 권장. 필요 시 주석 해제하되 실패해도 파이프라인은 진행.
+      # ▶ API Enable은 콘솔 1회 권장. 필요 시 유지하되 실패해도 진행.
       - name: Enable required Google APIs (optional)
         run: |
           gcloud services enable \
@@ -77,7 +97,7 @@ jobs:
           GOOGLE_APPLICATION_CREDENTIALS: ${{ env.GOOGLE_GHA_CREDS_PATH }}
         run: firebase deploy --only firestore:rules --project "${FIREBASE_PROJECT_ID}"
 
-      # ⚠️ 매 실행마다 새 비전이 생길 수 있음. 필요 없으면 주석 처리 가능.
+      # ⚠️ 매 실행마다 새 비전 생성될 수 있음. 필요 없으면 주석 처리.
       - name: Set Functions Secret (OPENAI_API_KEY)
         env:
           GOOGLE_APPLICATION_CREDENTIALS: ${{ env.GOOGLE_GHA_CREDS_PATH }}
