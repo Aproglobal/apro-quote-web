@@ -13,7 +13,7 @@ jobs:
       packages: read
 
     env:
-      FIREBASE_PROJECT_ID: ${{ secrets.FIREBASE_PROJECT_ID }}   # ➜ apro-quote-web-475705 로 넣어두기
+      FIREBASE_PROJECT_ID: ${{ secrets.FIREBASE_PROJECT_ID }}
 
     steps:
       - name: Checkout
@@ -27,14 +27,13 @@ jobs:
       - name: Auth to Google Cloud
         uses: google-github-actions/auth@v2
         with:
-          credentials_json: ${{ secrets.GCP_SA_KEY }}  # github-deployer 키(JSON)
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
           create_credentials_file: true
           export_environment_variables: true
 
       - name: Install Firebase CLI
         run: npm i -g firebase-tools@latest
 
-      # ---- Functions deps & build ----
       - name: Install deps (functions)
         working-directory: functions
         run: |
@@ -44,6 +43,18 @@ jobs:
         working-directory: functions
         run: npm run build --if-present
 
-      # ---- Deploy (시크릿은 콘솔에서 미리 생성) ----
+      # ✅ 추가: 필요한 API 보장
+      - name: Enable required Google APIs
+        run: |
+          gcloud services enable \
+            firebase.googleapis.com \
+            cloudfunctions.googleapis.com \
+            cloudbuild.googleapis.com \
+            artifactregistry.googleapis.com \
+            secretmanager.googleapis.com \
+            run.googleapis.com \
+            eventarc.googleapis.com \
+            --project "${FIREBASE_PROJECT_ID}"
+
       - name: Deploy Functions
         run: firebase deploy --only functions --project "${FIREBASE_PROJECT_ID}"
