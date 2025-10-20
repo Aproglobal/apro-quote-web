@@ -13,30 +13,33 @@ jobs:
       packages: read
 
     env:
-      # GitHub Secrets에 반드시 이 키를 추가: FIREBASE_PROJECT_ID=apro-quote-web-475705
+      # GitHub Secrets에 반드시 추가:
+      # FIREBASE_PROJECT_ID = apro-quote-web-475705
       FIREBASE_PROJECT_ID: ${{ secrets.FIREBASE_PROJECT_ID }}
-      # Puppeteer가 크로미움 다운로드 필요 없으면 주석 해제(네트워크 안정성↑)
+      # Puppeteer가 필요 없으면 주석 해제(네트워크/시간 절약)
       # PUPPETEER_SKIP_DOWNLOAD: "true"
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup Node.js (with npm cache)
+      - name: Setup Node.js (no cache here)
         uses: actions/setup-node@v4
         with:
           node-version: '20'
-          cache: 'npm'
-          # functions/ 기준으로 캐시 키 산출
-          cache-dependency-path: functions/package-lock.json
 
       - name: Auth to Google Cloud
         uses: google-github-actions/auth@v2
         with:
-          # GitHub Secrets에 GCP_SA_KEY(=github-deployer 서비스계정 키 JSON) 저장 필수
+          # GitHub Secrets: GCP_SA_KEY = github-deployer 서비스계정 키 JSON
           credentials_json: ${{ secrets.GCP_SA_KEY }}
           create_credentials_file: true
           export_environment_variables: true
+
+      - name: Setup gcloud CLI
+        uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: ${{ env.FIREBASE_PROJECT_ID }}
 
       - name: Install Firebase CLI (retry)
         run: |
@@ -56,12 +59,10 @@ jobs:
           npm config set timeout 600000
           npm config set registry "https://registry.npmjs.org/"
 
-      # ---------- functions 의존성(로컬 없이) ----------
-      # 잠깐짜리 lockfile을 CI에서 생성 → 그걸로 npm ci (결정론적 설치, 같은 런 안에서 안정)
-      - name: Generate ephemeral lockfile (no local needed)
+      # ---------- lockfile 먼저 생성 ----------
+      - name: Generate ephemeral lockfile
         working-directory: functions
         run: |
-          # lockfile만 생성(설치 X) → 네트워크 한번
           for i in 1 2 3; do
             npm i --package-lock-only --ignore-scripts --no-audit --progress=false && break || {
               echo "lockfile gen failed ($i/3). retry in 20s..."
@@ -69,7 +70,17 @@ jobs:
             }
           done
 
-      - name: Install deps (functions) with retry (using lockfile)
+      # ---------- ~/.npm 캐시를 lockfile 해시로 복구 ----------
+      - name: Restore npm cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.npm
+          key: ${{ runner.os }}-npm-${{ hashFiles('functions/package-lock.json') }}
+          restore-keys: |
+            ${{ runner.os }}-npm-
+
+      # ---------- 의존성 설치 ----------
+      - name: Install deps (functions) with retry
         working-directory: functions
         run: |
           for i in 1 2 3; do
@@ -83,7 +94,7 @@ jobs:
         working-directory: functions
         run: npm run build --if-present
 
-      # ---------- 필수 API 보장 (idempotent) ----------
+      # ---------- 필수 API 보장 ----------
       - name: Enable required Google APIs
         run: |
           gcloud services enable \
@@ -96,18 +107,16 @@ jobs:
             eventarc.googleapis.com \
             --project "${FIREBASE_PROJECT_ID}"
 
-      # ---------- 런타임 서비스계정에 Secret 접근권 부여 (Gen2 기본 계정) ----------
+      # ---------- 런타임 서비스계정에 Secret 접근권 ----------
       - name: Grant Secret Accessor to runtime SAs
         run: |
           PROJECT_NUMBER=$(gcloud projects describe "${FIREBASE_PROJECT_ID}" --format='value(projectNumber)')
-
-          # Cloud Functions Gen2 기본 런타임 SA (Cloud Run/Compute default)
           RUNTIME_SA="${PROJECT_NUMBER}-compute@developer.gserviceaccount.com"
           gcloud projects add-iam-policy-binding "${FIREBASE_PROJECT_ID}" \
             --member="serviceAccount:${RUNTIME_SA}" \
             --role="roles/secretmanager.secretAccessor"
 
-          # (겸사겸사) Gen1/기타에서 쓰일 수 있는 App Engine default SA도 허용 - 실패해도 무시
+          # (겸용) App Engine 기본 SA도 시도(없으면 무시)
           APPSPOT_SA="${FIREBASE_PROJECT_ID}@appspot.gserviceaccount.com"
           gcloud projects add-iam-policy-binding "${FIREBASE_PROJECT_ID}" \
             --member="serviceAccount:${APPSPOT_SA}" \
