@@ -99,14 +99,28 @@ ${req.data.freeText}`;
 // ---------- 3) HTML 템플릿 -> PDF/PNG ----------
 function rows(arr: any[], cols: string[]) {
   return (arr || [])
-    .map((r) => `<tr>${cols.map((c) => `<td>${["unitPrice","amount","price"].includes(c) ? money(r[c]) : (r[c] ?? "")}</td>`).join("")}</tr>`)
+    .map(
+      (r) =>
+        `<tr>${cols
+          .map(
+            (c) =>
+              `<td>${
+                ["unitPrice", "amount", "price"].includes(c)
+                  ? money(r[c])
+                  : r[c] ?? ""
+              }</td>`
+          )
+          .join("")}</tr>`
+    )
     .join("");
 }
 function renderHtml(q: any) {
   const dateStr =
     q?.date?.toDate?.() instanceof Date
       ? q.date.toDate().toISOString().slice(0, 10)
-      : (typeof q?.date === "string" ? q.date.slice(0, 10) : new Date().toISOString().slice(0, 10));
+      : typeof q?.date === "string"
+      ? q.date.slice(0, 10)
+      : new Date().toISOString().slice(0, 10);
 
   return `<!doctype html><html><head><meta charset="utf-8" />
 <style>
@@ -118,28 +132,62 @@ th,td{border:1px solid #bbb;padding:6px;text-align:left}
 .right{text-align:right}
 </style></head><body>
 <h1>견적서</h1>
-<div class="hdr">견적번호: <b>${q.quoteNo||""}</b> | 일자: ${dateStr}</div>
-<div class="hdr">견적대상: ${q.client||""} | 모델: ${q.model||""} | 담당: ${q.owner||""}</div>
-<div class="hdr">결제조건: ${q.payTerms||""} | 납기: ${q.deliveryTerms||""}</div>
+<div class="hdr">견적번호: <b>${q.quoteNo || ""}</b> | 일자: ${dateStr}</div>
+<div class="hdr">견적대상: ${q.client || ""} | 모델: ${q.model || ""} | 담당: ${
+    q.owner || ""
+  }</div>
+<div class="hdr">결제조건: ${q.payTerms || ""} | 납기: ${
+    q.deliveryTerms || ""
+  }</div>
 
 <h3>본 품목</h3>
 <table><thead><tr><th>수량</th><th>품목</th><th>단가</th><th>금액</th></tr></thead>
 <tbody>${rows(q.items, ["qty","description","unitPrice","amount"])}</tbody></table>
 
-${q.installed?.length?`<h3>장착 옵션</h3>
+${
+  q.installed?.length
+    ? `<h3>장착 옵션</h3>
 <table><thead><tr><th>옵션</th><th class="right">금액</th></tr></thead>
-<tbody>${rows(q.installed.map((x:any)=>({description:x.description,price:x.price})),["description","price"])}</tbody></table>`:""}
+<tbody>${rows(
+        q.installed.map((x: any) => ({
+          description: x.description,
+          price: x.price,
+        })),
+        ["description", "price"]
+      )}</tbody></table>`
+    : ""
+}
 
-${q.paid?.length?`<h3>유상 옵션</h3>
+${
+  q.paid?.length
+    ? `<h3>유상 옵션</h3>
 <table><thead><tr><th>옵션</th><th class="right">금액</th></tr></thead>
-<tbody>${rows(q.paid.map((x:any)=>({description:x.description,price:x.price})),["description","price"])}</tbody></table>`:""}
+<tbody>${rows(
+        q.paid.map((x: any) => ({
+          description: x.description,
+          price: x.price,
+        })),
+        ["description", "price"]
+      )}</tbody></table>`
+    : ""
+}
 
-${q.extra?.length?`<h3>추가 옵션</h3>
+${
+  q.extra?.length
+    ? `<h3>추가 옵션</h3>
 <table><thead><tr><th>옵션</th><th class="right">금액</th></tr></thead>
-<tbody>${rows(q.extra.map((x:any)=>({description:x.description,price:x.price})),["description","price"])}</tbody></table>`:""}
+<tbody>${rows(
+        q.extra.map((x: any) => ({
+          description: x.description,
+          price: x.price,
+        })),
+        ["description", "price"]
+      )}</tbody></table>`
+    : ""
+}
 
-<h2 class="right">합계 금액: ${money(q.grandTotal||0)} 원</h2>
-${q.memo?`<div>비고: ${q.memo}</div>`:""}
+<h2 class="right">합계 금액: ${money(q.grandTotal || 0)} 원</h2>
+${q.memo ? `<div>비고: ${q.memo}</div>` : ""}
 </body></html>`;
 }
 
@@ -157,7 +205,7 @@ export const generatePdfAndPng = onCall(
     const html = renderHtml(q);
 
     const browser = await puppeteer.launch({
-      // 일부 버전의 @types 정의에서 "new" 리터럴 미지원 → boolean으로 호환
+      // 타입 호환 문제 방지: "new" 대신 boolean 사용
       headless: true,
       args: ["--no-sandbox", "--disable-setuid-sandbox"],
     });
@@ -239,12 +287,12 @@ function cosine(a: number[], b: number[]) {
 
 export const onQuoteWriteEmbed = onDocumentWritten(
   {
+    document: "quotes/{id}", // 👈 v2 시그니처: options 안에 document 포함(2-arg)
     region: "asia-northeast3",
     secrets: [OPENAI_API_KEY],
     timeoutSeconds: 120,
     memory: "512MiB",
   },
-  "quotes/{id}",
   async (e: any) => {
     const after = e.data?.after?.data();
     if (!after) return;
