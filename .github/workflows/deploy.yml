@@ -1,12 +1,10 @@
-name: Deploy to Firebase (lightweight, SA JSON only)
+# .github/workflows/deploy.yml
+name: Deploy to Firebase (Functions + optional Hosting)
 
 on:
   push:
     branches: [ "main" ]
   workflow_dispatch: {}
-
-permissions:
-  contents: read
 
 jobs:
   deploy:
@@ -19,53 +17,40 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # 서비스계정(JSON)으로 Firebase CLI가 쓰는 ADC 설정
-      - name: Auth with Service Account (ADC)
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Authenticate to Google Cloud
         uses: google-github-actions/auth@v2
         with:
           credentials_json: ${{ secrets.GCP_SA_KEY }}
           create_credentials_file: true
           export_environment_variables: true
 
-      - name: Setup Node
-        uses: actions/setup-node@v4
-        with:
-          node-version: 20
-
       - name: Install Firebase CLI
         run: npm i -g firebase-tools@latest
 
-      # Functions
+      # ----- Functions deps & build -----
       - name: Install deps (functions)
         working-directory: functions
         run: |
-          if [ -f package-lock.json ]; then npm ci; else npm install; fi
+          if [ -f package-lock.json ]; then npm ci; else npm i; fi
 
-      - name: Build Functions
+      - name: Build (functions)
         working-directory: functions
-        run: npm run build
+        run: npm run build --if-present
 
-      # (선택) Secret 주입 — 자주 바뀌지 않으면 주석 처리 권장
+      # ----- Set secret (no --data; pass via STDIN) -----
       - name: Set Functions Secret (OPENAI_API_KEY)
-        if: ${{ env.OPENAI_API_KEY != '' }}
         run: |
-          firebase functions:secrets:set OPENAI_API_KEY \
-            --project "${FIREBASE_PROJECT_ID}" \
-            --data "${OPENAI_API_KEY}"
+          printf "%s" "${OPENAI_API_KEY}" | firebase functions:secrets:set OPENAI_API_KEY --project "${FIREBASE_PROJECT_ID}"
 
-      - name: Deploy Firestore Rules
-        run: firebase deploy --only firestore:rules --project "${FIREBASE_PROJECT_ID}"
-
-      # Web
-      - name: Install deps (web)
-        run: |
-          if [ -f package-lock.json ]; then npm ci; else npm install; fi
-
-      - name: Build Web
-        run: npm run build
-
+      # ----- Deploy -----
       - name: Deploy Functions
         run: firebase deploy --only functions --project "${FIREBASE_PROJECT_ID}"
 
-      - name: Deploy Hosting
+      - name: Deploy Hosting (optional)
+        if: ${{ hashFiles('firebase.json') != '' }}
         run: firebase deploy --only hosting --project "${FIREBASE_PROJECT_ID}"
