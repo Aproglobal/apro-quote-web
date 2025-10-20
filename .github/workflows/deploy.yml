@@ -2,7 +2,8 @@ name: Deploy to Firebase (Hosting + Functions + Rules)
 
 on:
   push:
-    branches: [ "main" ]   # 배포 트리거 브랜치 (원하면 변경)
+    branches: [ "main" ]
+  workflow_dispatch: {}
 
 jobs:
   deploy:
@@ -11,7 +12,6 @@ jobs:
     env:
       FIREBASE_PROJECT_ID: ${{ secrets.FIREBASE_PROJECT_ID }}
       OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-      GCP_SA_KEY: ${{ secrets.GCP_SA_KEY }}
 
     steps:
       - name: Checkout
@@ -21,38 +21,50 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: '20'
+          cache: 'npm'
 
-      # 서비스 계정 키 파일 생성
-      - name: Write GCP credentials to file
-        run: |
-          echo "$GCP_SA_KEY" > "${{ runner.temp }}/gcp-key.json"
+      # Google 인증 (서비스 계정 키)
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - name: Setup gcloud SDK
+        uses: google-github-actions/setup-gcloud@v2
 
       - name: Install Firebase CLI
         run: npm i -g firebase-tools
 
-      # Firebase 인증 (서비스 계정으로)
-      - name: Firebase Auth (gcloud style)
+      # (중요) 필요한 API 한 번에 활성화 — 403 방지
+      - name: Enable required Google APIs
         run: |
-          gcloud auth activate-service-account --key-file="${{ runner.temp }}/gcp-key.json" || true
-          export GOOGLE_APPLICATION_CREDENTIALS="${{ runner.temp }}/gcp-key.json"
-          echo "GOOGLE_APPLICATION_CREDENTIALS=${{ runner.temp }}/gcp-key.json" >> $GITHUB_ENV
+          gcloud services enable \
+            firestore.googleapis.com \
+            firebaserules.googleapis.com \
+            cloudfunctions.googleapis.com \
+            cloudbuild.googleapis.com \
+            artifactregistry.googleapis.com \
+            secretmanager.googleapis.com \
+            storage.googleapis.com \
+            --project "${FIREBASE_PROJECT_ID}"
 
-      # 프로젝트 ID 주입(선택) - .firebaserc에 placeholder가 있다면 치환
-      - name: Patch .firebaserc
+      # .firebaserc의 placeholder 치환(있을 때만)
+      - name: Patch .firebaserc (optional)
         run: |
-          sed -i "s/FIREBASE_PROJECT_ID_PLACEHOLDER/$FIREBASE_PROJECT_ID/g" .firebaserc || true
+          if [ -f ".firebaserc" ]; then
+            sed -i "s/FIREBASE_PROJECT_ID_PLACEHOLDER/${FIREBASE_PROJECT_ID}/g" .firebaserc || true
+          fi
 
-      # Firestore 규칙 배포 (선 배포 권장)
+      # Firestore Rules 배포
       - name: Deploy Firestore Rules
-        run: firebase deploy --only firestore:rules --project "$FIREBASE_PROJECT_ID"
+        run: firebase deploy --only firestore:rules --project "${FIREBASE_PROJECT_ID}"
 
-      # Functions: OPENAI_API_KEY를 Firebase Secrets에 저장/갱신
-      # (반복 실행해도 안전)
+      # Functions Secret 설정/갱신 (OPENAI_API_KEY)
       - name: Set Functions Secret (OPENAI_API_KEY)
         run: |
           firebase functions:secrets:set OPENAI_API_KEY \
-            --project "$FIREBASE_PROJECT_ID" \
-            --data "$OPENAI_API_KEY"
+            --project "${FIREBASE_PROJECT_ID}" \
+            --data "${OPENAI_API_KEY}"
 
       # Functions 빌드 & 배포
       - name: Build Functions
@@ -62,13 +74,14 @@ jobs:
           npm run build
 
       - name: Deploy Functions
-        run: firebase deploy --only functions --project "$FIREBASE_PROJECT_ID"
+        run: firebase deploy --only functions --project "${FIREBASE_PROJECT_ID}"
 
-      # 프론트 빌드 & Hosting 배포
+      # 프론트 빌드 (⚠️ Vite 기본 outDir=dist)
       - name: Build Web
         run: |
           npm ci
           npm run build
 
+      # Hosting 배포 (firebase.json의 "public"이 dist 인지 확인!)
       - name: Deploy Hosting
-        run: firebase deploy --only hosting --project "$FIREBASE_PROJECT_ID"
+        run: firebase deploy --only hosting --project "${FIREBASE_PROJECT_ID}"
