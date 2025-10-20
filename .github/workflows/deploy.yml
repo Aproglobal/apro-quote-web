@@ -1,113 +1,29 @@
-# .github/workflows/deploy.yml
-name: Firebase Deploy (No Local, SA Only)
+name: Deploy to Firebase (lightweight, SA JSON only)
 
 on:
   push:
     branches: [ "main" ]
   workflow_dispatch: {}
 
-concurrency:
-  group: deploy-${{ github.ref }}
-  cancel-in-progress: true
-
 permissions:
   contents: read
 
 jobs:
-  # 1) 권한/API 부트스트랩 (Owner 권한 SA 필요) — 필요 없으면 workflow_dispatch로만 돌리세요.
-  bootstrap:
-    runs-on: ubuntu-latest
-    env:
-      PROJECT_ID: ${{ secrets.FIREBASE_PROJECT_ID }}
-      DEPLOY_SA: github-deployer@${{ secrets.FIREBASE_PROJECT_ID }}.iam.gserviceaccount.com
-
-    steps:
-      # 필수 시크릿 점검 (없으면 즉시 실패)
-      - name: Check required secrets (bootstrap)
-        run: |
-          [ -n "${{ secrets.GCP_BOOTSTRAP_SA_KEY }}" ] || { echo "::error::Missing secret GCP_BOOTSTRAP_SA_KEY"; exit 1; }
-          [ -n "${{ secrets.FIREBASE_PROJECT_ID }}" ]   || { echo "::error::Missing secret FIREBASE_PROJECT_ID"; exit 1; }
-
-      - name: Auth as BOOTSTRAP (OWNER SA)
-        uses: google-github-actions/auth@v2
-        with:
-          credentials_json: ${{ secrets.GCP_BOOTSTRAP_SA_KEY }}  # 👈 반드시 명시
-          create_credentials_file: true
-          export_environment_variables: true
-
-      - name: Setup gcloud
-        uses: google-github-actions/setup-gcloud@v2
-
-      - name: Enable required APIs (one-time)
-        run: |
-          gcloud services enable \
-            firestore.googleapis.com \
-            firebaserules.googleapis.com \
-            cloudfunctions.googleapis.com \
-            cloudbuild.googleapis.com \
-            artifactregistry.googleapis.com \
-            secretmanager.googleapis.com \
-            storage.googleapis.com \
-            --project "${PROJECT_ID}"
-
-      - name: Compute project number
-        id: vars
-        run: |
-          PN=$(gcloud projects describe "${PROJECT_ID}" --format='value(projectNumber)')
-          echo "PN=${PN}" >> $GITHUB_OUTPUT
-
-      - name: Grant minimal roles to DEPLOY SA
-        run: |
-          SA="${DEPLOY_SA}"
-          PROJECT_ID="${{ env.PROJECT_ID }}"
-          PN="${{ steps.vars.outputs.PN }}"
-          RUNTIME_SA1="${PROJECT_ID}@appspot.gserviceaccount.com"
-          RUNTIME_SA2="${PN}-compute@developer.gserviceaccount.com"
-          CLOUDBUILD_SA="${PN}@cloudbuild.gserviceaccount.com"
-
-          # View / Service Usage (조회)
-          gcloud projects add-iam-policy-binding "${PROJECT_ID}" --member="serviceAccount:${SA}" --role="roles/viewer"
-          gcloud projects add-iam-policy-binding "${PROJECT_ID}" --member="serviceAccount:${SA}" --role="roles/serviceusage.serviceUsageViewer"
-
-          # Firebase Hosting / Rules
-          gcloud projects add-iam-policy-binding "${PROJECT_ID}" --member="serviceAccount:${SA}" --role="roles/firebasehosting.admin"
-          gcloud projects add-iam-policy-binding "${PROJECT_ID}" --member="serviceAccount:${SA}" --role="roles/firebaserules.admin"
-
-          # Functions Gen2 배포 스택
-          gcloud projects add-iam-policy-binding "${PROJECT_ID}" --member="serviceAccount:${SA}" --role="roles/cloudfunctions.developer"
-          gcloud projects add-iam-policy-binding "${PROJECT_ID}" --member="serviceAccount:${SA}" --role="roles/run.admin"
-          gcloud projects add-iam-policy-binding "${PROJECT_ID}" --member="serviceAccount:${SA}" --role="roles/artifactregistry.writer"
-          gcloud projects add-iam-policy-binding "${PROJECT_ID}" --member="serviceAccount:${SA}" --role="roles/cloudbuild.builds.editor"
-
-          # 런타임 SA 사용 권한
-          gcloud iam service-accounts add-iam-policy-binding "${RUNTIME_SA1}" --member="serviceAccount:${SA}" --role="roles/iam.serviceAccountUser" --project "${PROJECT_ID}" || true
-          gcloud iam service-accounts add-iam-policy-binding "${RUNTIME_SA2}" --member="serviceAccount:${SA}" --role="roles/iam.serviceAccountUser" --project "${PROJECT_ID}" || true
-
-          # Cloud Build SA도 런타임 SA 사용 권한(환경에 따라 필요)
-          gcloud iam service-accounts add-iam-policy-binding "${RUNTIME_SA1}" --member="serviceAccount:${CLOUDBUILD_SA}" --role="roles/iam.serviceAccountUser" --project "${PROJECT_ID}" || true
-          gcloud iam service-accounts add-iam-policy-binding "${RUNTIME_SA2}" --member="serviceAccount:${CLOUDBUILD_SA}" --role="roles/iam.serviceAccountUser" --project "${PROJECT_ID}" || true
-
-  # 2) 실제 배포 (배포 SA JSON으로 Firebase CLI 인증) — gcloud 불필요
   deploy:
-    needs: [bootstrap]
     runs-on: ubuntu-latest
     env:
       FIREBASE_PROJECT_ID: ${{ secrets.FIREBASE_PROJECT_ID }}
       OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
 
     steps:
-      - name: Check required secrets (deploy)
-        run: |
-          [ -n "${{ secrets.GCP_SA_KEY }}" ]           || { echo "::error::Missing secret GCP_SA_KEY"; exit 1; }
-          [ -n "${{ secrets.FIREBASE_PROJECT_ID }}" ]  || { echo "::error::Missing secret FIREBASE_PROJECT_ID"; exit 1; }
-
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Auth as DEPLOY SA (ADC for Firebase CLI)
+      # 서비스계정(JSON)으로 Firebase CLI가 쓰는 ADC 설정
+      - name: Auth with Service Account (ADC)
         uses: google-github-actions/auth@v2
         with:
-          credentials_json: ${{ secrets.GCP_SA_KEY }}   # 👈 반드시 명시
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
           create_credentials_file: true
           export_environment_variables: true
 
@@ -115,25 +31,6 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: 20
-
-      # Optional caches (lock 있을 때만)
-      - name: Cache root node_modules
-        if: ${{ hashFiles('package-lock.json') != '' }}
-        uses: actions/cache@v4
-        with:
-          path: node_modules
-          key: node-${{ runner.os }}-20-${{ hashFiles('package-lock.json') }}
-          restore-keys: |
-            node-${{ runner.os }}-20-
-
-      - name: Cache functions node_modules
-        if: ${{ hashFiles('functions/package-lock.json') != '' }}
-        uses: actions/cache@v4
-        with:
-          path: functions/node_modules
-          key: node-func-${{ runner.os }}-20-${{ hashFiles('functions/package-lock.json') }}
-          restore-keys: |
-            node-func-${{ runner.os }}-20-
 
       - name: Install Firebase CLI
         run: npm i -g firebase-tools@latest
@@ -148,7 +45,7 @@ jobs:
         working-directory: functions
         run: npm run build
 
-      # (선택) Functions Secret 주입 — 매번 새 버전 생성됨. 필요 없으면 주석 처리.
+      # (선택) Secret 주입 — 자주 바뀌지 않으면 주석 처리 권장
       - name: Set Functions Secret (OPENAI_API_KEY)
         if: ${{ env.OPENAI_API_KEY != '' }}
         run: |
