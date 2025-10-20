@@ -1,5 +1,5 @@
 # .github/workflows/deploy.yml
-name: Deploy to Firebase (Functions + optional Hosting)
+name: Deploy Firebase Functions
 
 on:
   push:
@@ -9,20 +9,23 @@ on:
 jobs:
   deploy:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
+
     env:
       FIREBASE_PROJECT_ID: ${{ secrets.FIREBASE_PROJECT_ID }}
-      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup Node
+      - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
           node-version: '20'
 
-      - name: Authenticate to Google Cloud
+      - name: Auth to Google Cloud
         uses: google-github-actions/auth@v2
         with:
           credentials_json: ${{ secrets.GCP_SA_KEY }}
@@ -32,7 +35,7 @@ jobs:
       - name: Install Firebase CLI
         run: npm i -g firebase-tools@latest
 
-      # ----- Functions deps & build -----
+      # ---- Functions deps & build ----
       - name: Install deps (functions)
         working-directory: functions
         run: |
@@ -42,15 +45,6 @@ jobs:
         working-directory: functions
         run: npm run build --if-present
 
-      # ----- Set secret (no --data; pass via STDIN) -----
-      - name: Set Functions Secret (OPENAI_API_KEY)
-        run: |
-          printf "%s" "${OPENAI_API_KEY}" | firebase functions:secrets:set OPENAI_API_KEY --project "${FIREBASE_PROJECT_ID}"
-
-      # ----- Deploy -----
+      # ---- Deploy (시크릿은 콘솔에서 미리 생성) ----
       - name: Deploy Functions
         run: firebase deploy --only functions --project "${FIREBASE_PROJECT_ID}"
-
-      - name: Deploy Hosting (optional)
-        if: ${{ hashFiles('firebase.json') != '' }}
-        run: firebase deploy --only hosting --project "${FIREBASE_PROJECT_ID}"
