@@ -1,15 +1,20 @@
 // functions/src/index.ts
-import * as admin from "firebase-admin";
+import { initializeApp, getApps } from "firebase-admin/app";
+import { getFirestore, FieldValue, Timestamp } from "firebase-admin/firestore";
+import { getStorage } from "firebase-admin/storage";
+
 import { onCall } from "firebase-functions/v2/https";
 import { onDocumentWritten } from "firebase-functions/v2/firestore";
 import * as logger from "firebase-functions/logger";
-import OpenAI from "openai";
-import puppeteer from "puppeteer";
 import { defineSecret } from "firebase-functions/params";
 
-if (!admin.apps.length) admin.initializeApp();
-const db = admin.firestore();
-const bucket = admin.storage().bucket();
+import OpenAI from "openai";
+import puppeteer from "puppeteer";
+
+// ---- Firebase Admin 초기화 (모듈식 API) ----
+if (getApps().length === 0) initializeApp();
+const db = getFirestore();
+const bucket = getStorage().bucket();
 
 // ---------- 공통 ----------
 const OPENAI_API_KEY = defineSecret("OPENAI_API_KEY");
@@ -36,9 +41,9 @@ export const newQuoteNumber = onCall(
       seq,
       subSeq: 1,
       quoteNo,
-      date: admin.firestore.Timestamp.fromDate(now),
-      owner: req.data?.owner ?? "",
-      client: req.data?.client ?? "",
+      date: Timestamp.fromDate(now),
+      owner: req?.data?.owner ?? "",
+      client: req?.data?.client ?? "",
       status: "draft",
     });
 
@@ -49,7 +54,10 @@ export const newQuoteNumber = onCall(
 export const newRevisionNumber = onCall(
   { region: "asia-northeast3" },
   async (req: any) => {
-    const qRef = db.collection("quotes").doc(req.data.quoteId);
+    const quoteId = req?.data?.quoteId;
+    if (!quoteId) throw new Error("quoteId is required");
+
+    const qRef = db.collection("quotes").doc(quoteId);
     const { newNo } = await db.runTransaction(async (tx) => {
       const s = await tx.get(qRef);
       if (!s.exists) throw new Error("quote not found");
@@ -59,7 +67,7 @@ export const newRevisionNumber = onCall(
       tx.update(qRef, {
         subSeq: sub,
         quoteNo: newNo,
-        date: admin.firestore.Timestamp.now(),
+        date: Timestamp.now(),
         status: "revised",
       });
       return { newNo };
@@ -78,42 +86,61 @@ export const aiNormalize = onCall(
   },
   async (req: any) => {
     const client = new OpenAI({ apiKey: OPENAI_API_KEY.value() });
+    const freeText = String(req?.data?.freeText ?? "").trim();
+
     const prompt = `다음 견적 요청 문장을 JSON으로 구조화.
 필드: client, model, items[{qty, description, unitPrice?}],
 installed[], paid[], extra[], payTerms, deliveryTerms, memo, owner?
 숫자는 정수/원, 모르면 생략. JSON만 출력.
 
 문장:
-${req.data.freeText}`;
+${freeText}`;
 
     const r = await client.chat.completions.create({
       model: "gpt-4o-mini",
       temperature: 0.2,
       messages: [{ role: "user", content: prompt }],
     });
-    const text = r.choices[0]?.message?.content || "{}";
-    return { data: JSON.parse(text) };
+
+    const raw = r.choices?.[0]?.message?.content ?? "{}";
+
+    // 안전 파싱 (백틱/설명 제거 시도)
+    const cleaned = raw
+      .replace(/^```json\s*/i, "")
+      .replace(/^```\s*/i, "")
+      .replace(/```$/i, "")
+      .trim();
+
+    let parsed: any = {};
+    try {
+      parsed = JSON.parse(cleaned);
+    } catch {
+      logger.warn("[aiNormalize] JSON parse failed, returning empty object");
+      parsed = {};
+    }
+    return { data: parsed };
   }
 );
 
 // ---------- 3) HTML 템플릿 -> PDF/PNG ----------
 function rows(arr: any[], cols: string[]) {
-  return (arr || [])
+  return (arr ?? [])
     .map(
       (r) =>
         `<tr>${cols
-          .map(
-            (c) =>
-              `<td>${
-                ["unitPrice", "amount", "price"].includes(c)
-                  ? money(r[c])
-                  : r[c] ?? ""
-              }</td>`
-          )
+          .map((c) => {
+            const v = (r ?? {})[c];
+            const formatted =
+              ["unitPrice", "amount", "price"].includes(c) && typeof v === "number"
+                ? money(v)
+                : v ?? "";
+            return `<td>${formatted}</td>`;
+          })
           .join("")}</tr>`
     )
     .join("");
 }
+
 function renderHtml(q: any) {
   const dateStr =
     q?.date?.toDate?.() instanceof Date
@@ -132,26 +159,22 @@ th,td{border:1px solid #bbb;padding:6px;text-align:left}
 .right{text-align:right}
 </style></head><body>
 <h1>견적서</h1>
-<div class="hdr">견적번호: <b>${q.quoteNo || ""}</b> | 일자: ${dateStr}</div>
-<div class="hdr">견적대상: ${q.client || ""} | 모델: ${q.model || ""} | 담당: ${
-    q.owner || ""
-  }</div>
-<div class="hdr">결제조건: ${q.payTerms || ""} | 납기: ${
-    q.deliveryTerms || ""
-  }</div>
+<div class="hdr">견적번호: <b>${q?.quoteNo ?? ""}</b> | 일자: ${dateStr}</div>
+<div class="hdr">견적대상: ${q?.client ?? ""} | 모델: ${q?.model ?? ""} | 담당: ${q?.owner ?? ""}</div>
+<div class="hdr">결제조건: ${q?.payTerms ?? ""} | 납기: ${q?.deliveryTerms ?? ""}</div>
 
 <h3>본 품목</h3>
 <table><thead><tr><th>수량</th><th>품목</th><th>단가</th><th>금액</th></tr></thead>
-<tbody>${rows(q.items, ["qty","description","unitPrice","amount"])}</tbody></table>
+<tbody>${rows(q?.items ?? [], ["qty","description","unitPrice","amount"])}</tbody></table>
 
 ${
-  q.installed?.length
+  (q?.installed?.length ?? 0) > 0
     ? `<h3>장착 옵션</h3>
 <table><thead><tr><th>옵션</th><th class="right">금액</th></tr></thead>
 <tbody>${rows(
-        q.installed.map((x: any) => ({
-          description: x.description,
-          price: x.price,
+        (q.installed ?? []).map((x: any) => ({
+          description: x?.description ?? "",
+          price: x?.price ?? 0,
         })),
         ["description", "price"]
       )}</tbody></table>`
@@ -159,13 +182,13 @@ ${
 }
 
 ${
-  q.paid?.length
+  (q?.paid?.length ?? 0) > 0
     ? `<h3>유상 옵션</h3>
 <table><thead><tr><th>옵션</th><th class="right">금액</th></tr></thead>
 <tbody>${rows(
-        q.paid.map((x: any) => ({
-          description: x.description,
-          price: x.price,
+        (q.paid ?? []).map((x: any) => ({
+          description: x?.description ?? "",
+          price: x?.price ?? 0,
         })),
         ["description", "price"]
       )}</tbody></table>`
@@ -173,21 +196,21 @@ ${
 }
 
 ${
-  q.extra?.length
+  (q?.extra?.length ?? 0) > 0
     ? `<h3>추가 옵션</h3>
 <table><thead><tr><th>옵션</th><th class="right">금액</th></tr></thead>
 <tbody>${rows(
-        q.extra.map((x: any) => ({
-          description: x.description,
-          price: x.price,
+        (q.extra ?? []).map((x: any) => ({
+          description: x?.description ?? "",
+          price: x?.price ?? 0,
         })),
         ["description", "price"]
       )}</tbody></table>`
     : ""
 }
 
-<h2 class="right">합계 금액: ${money(q.grandTotal || 0)} 원</h2>
-${q.memo ? `<div>비고: ${q.memo}</div>` : ""}
+<h2 class="right">합계 금액: ${money(q?.grandTotal ?? 0)} 원</h2>
+${q?.memo ? `<div>비고: ${q.memo}</div>` : ""}
 </body></html>`;
 }
 
@@ -198,14 +221,16 @@ export const generatePdfAndPng = onCall(
     memory: "1GiB",
   },
   async (req: any) => {
-    const ref = db.collection("quotes").doc(req.data.quoteId);
+    const quoteId = req?.data?.quoteId;
+    if (!quoteId) throw new Error("quoteId is required");
+
+    const ref = db.collection("quotes").doc(quoteId);
     const s = await ref.get();
     if (!s.exists) throw new Error("quote not found");
     const q = s.data()!;
     const html = renderHtml(q);
 
     const browser = await puppeteer.launch({
-      // 타입 호환 문제 방지: "new" 대신 boolean 사용
       headless: true,
       args: ["--no-sandbox", "--disable-setuid-sandbox"],
     });
@@ -220,8 +245,10 @@ export const generatePdfAndPng = onCall(
     const pngBuf = await page.screenshot({ type: "png", fullPage: true });
     await browser.close();
 
-    const safe = (s: string) => (s || "").replace(/[^\w가-힣.-]/g, "_");
-    const base = `${safe(q.quoteNo)}_${safe(q.client)}_${safe(q.model)}`;
+    const safeName = (s: string) => (s || "").replace(/[^\w가-힣.-]/g, "_");
+    const base = `${safeName(q?.quoteNo ?? "")}_${safeName(q?.client ?? "")}_${safeName(
+      q?.model ?? ""
+    )}`;
     const pdfPath = `quotes/${base}.pdf`;
     const pngPath = `quotes/${base}.png`;
 
@@ -242,22 +269,22 @@ export const generatePdfAndPng = onCall(
 
 // ---------- 4) RAG 1단계: 임베딩 + 유사 견적 ----------
 function quoteToText(q: any) {
-  const items = (q.items || [])
-    .map((r: any) => `${r.qty || 0}x ${r.description || ""} @${r.unitPrice || 0}`)
+  const items = (q?.items ?? [])
+    .map((r: any) => `${r?.qty ?? 0}x ${r?.description ?? ""} @${r?.unitPrice ?? 0}`)
     .join("; ");
-  const i2 = (q.installed || []).map((r: any) => r.description).join(", ");
-  const p2 = (q.paid || []).map((r: any) => r.description).join(", ");
-  const e2 = (q.extra || []).map((r: any) => r.description).join(", ");
+  const i2 = (q?.installed ?? []).map((r: any) => r?.description ?? "").join(", ");
+  const p2 = (q?.paid ?? []).map((r: any) => r?.description ?? "").join(", ");
+  const e2 = (q?.extra ?? []).map((r: any) => r?.description ?? "").join(", ");
   return [
-    `client:${q.client || ""}`,
-    `model:${q.model || ""}`,
+    `client:${q?.client ?? ""}`,
+    `model:${q?.model ?? ""}`,
     `items:${items}`,
     i2 ? `installed:${i2}` : "",
     p2 ? `paid:${p2}` : "",
     e2 ? `extra:${e2}` : "",
-    `payTerms:${q.payTerms || ""}`,
-    `deliveryTerms:${q.deliveryTerms || ""}`,
-    `memo:${q.memo || ""}`,
+    `payTerms:${q?.payTerms ?? ""}`,
+    `deliveryTerms:${q?.deliveryTerms ?? ""}`,
+    `memo:${q?.memo ?? ""}`,
   ]
     .filter(Boolean)
     .join("\n");
@@ -270,11 +297,12 @@ async function embed(text: string, client: OpenAI) {
   });
   return res.data[0].embedding as unknown as number[];
 }
+
 function cosine(a: number[], b: number[]) {
   let dot = 0,
     na = 0,
     nb = 0;
-  const n = Math.min(a.length, b.length);
+  const n = Math.min(a?.length ?? 0, b?.length ?? 0);
   for (let i = 0; i < n; i++) {
     const x = a[i],
       y = b[i];
@@ -287,21 +315,21 @@ function cosine(a: number[], b: number[]) {
 
 export const onQuoteWriteEmbed = onDocumentWritten(
   {
-    document: "quotes/{id}", // 👈 v2 시그니처: options 안에 document 포함(2-arg)
+    document: "quotes/{id}",
     region: "asia-northeast3",
     secrets: [OPENAI_API_KEY],
     timeoutSeconds: 120,
     memory: "512MiB",
   },
   async (e: any) => {
-    const after = e.data?.after?.data();
+    const after = e?.data?.after?.data?.();
     if (!after) return;
     try {
       const client = new OpenAI({ apiKey: OPENAI_API_KEY.value() });
       const vec = await embed(quoteToText(after), client);
       await e.data!.after!.ref.update({
         embedding: vec,
-        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        updatedAt: FieldValue.serverTimestamp(),
       });
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
@@ -318,12 +346,14 @@ export const similarQuotes = onCall(
     memory: "512MiB",
   },
   async (req: any) => {
-    const q = (req.data?.query || "").trim();
+    const q = String(req?.data?.query ?? "").trim();
     if (!q) return { items: [] };
+
     const client = new OpenAI({ apiKey: OPENAI_API_KEY.value() });
     const qVec = await embed(q, client);
 
     const snaps = await db.collection("quotes").orderBy("date", "desc").limit(200).get();
+
     type Rank = {
       id: string;
       quoteNo: string;
@@ -333,14 +363,15 @@ export const similarQuotes = onCall(
       date?: any;
       score: number;
     };
+
     const ranks: Rank[] = [];
     snaps.forEach((s) => {
-      const d = s.data() || {};
+      const d: any = s.data() ?? {};
       if (!d.embedding) return;
       const score = cosine(qVec, d.embedding);
       ranks.push({
         id: s.id,
-        quoteNo: d.quoteNo || "",
+        quoteNo: d.quoteNo ?? "",
         client: d.client,
         model: d.model,
         grandTotal: d.grandTotal,
@@ -348,10 +379,12 @@ export const similarQuotes = onCall(
         score,
       });
     });
+
     ranks.sort((a, b) => b.score - a.score);
     const top = ranks
-      .slice(0, req.data?.limit ?? 5)
+      .slice(0, req?.data?.limit ?? 5)
       .map((r) => ({ ...r, score: Number(r.score.toFixed(4)) }));
+
     return { items: top };
   }
 );
