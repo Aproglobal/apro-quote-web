@@ -1,3 +1,4 @@
+# .github/workflows/deploy.yml
 name: Firebase Deploy (No Local, SA Only)
 
 on:
@@ -13,17 +14,24 @@ permissions:
   contents: read
 
 jobs:
-  # 1) GitHub에서 바로 권한/API 부트스트랩 (Owner SA로 실행)
+  # 1) 권한/API 부트스트랩 (Owner 권한 SA 필요) — 필요 없으면 workflow_dispatch로만 돌리세요.
   bootstrap:
     runs-on: ubuntu-latest
     env:
       PROJECT_ID: ${{ secrets.FIREBASE_PROJECT_ID }}
       DEPLOY_SA: github-deployer@${{ secrets.FIREBASE_PROJECT_ID }}.iam.gserviceaccount.com
+
     steps:
-      - name: Auth as BOOTSTRAP(OWNER SA)
+      # 필수 시크릿 점검 (없으면 즉시 실패)
+      - name: Check required secrets (bootstrap)
+        run: |
+          [ -n "${{ secrets.GCP_BOOTSTRAP_SA_KEY }}" ] || { echo "::error::Missing secret GCP_BOOTSTRAP_SA_KEY"; exit 1; }
+          [ -n "${{ secrets.FIREBASE_PROJECT_ID }}" ]   || { echo "::error::Missing secret FIREBASE_PROJECT_ID"; exit 1; }
+
+      - name: Auth as BOOTSTRAP (OWNER SA)
         uses: google-github-actions/auth@v2
         with:
-          credentials_json: ${{ secrets.GCP_BOOTSTRAP_SA_KEY }}
+          credentials_json: ${{ secrets.GCP_BOOTSTRAP_SA_KEY }}  # 👈 반드시 명시
           create_credentials_file: true
           export_environment_variables: true
 
@@ -57,7 +65,7 @@ jobs:
           RUNTIME_SA2="${PN}-compute@developer.gserviceaccount.com"
           CLOUDBUILD_SA="${PN}@cloudbuild.gserviceaccount.com"
 
-          # View / Service Usage (조회 권한)
+          # View / Service Usage (조회)
           gcloud projects add-iam-policy-binding "${PROJECT_ID}" --member="serviceAccount:${SA}" --role="roles/viewer"
           gcloud projects add-iam-policy-binding "${PROJECT_ID}" --member="serviceAccount:${SA}" --role="roles/serviceusage.serviceUsageViewer"
 
@@ -71,33 +79,35 @@ jobs:
           gcloud projects add-iam-policy-binding "${PROJECT_ID}" --member="serviceAccount:${SA}" --role="roles/artifactregistry.writer"
           gcloud projects add-iam-policy-binding "${PROJECT_ID}" --member="serviceAccount:${SA}" --role="roles/cloudbuild.builds.editor"
 
-          # 런타임 SA 사용 권한 (Functions/Cloud Run 실행 서비스계정)
-          gcloud iam service-accounts add-iam-policy-binding "${RUNTIME_SA1}" \
-            --member="serviceAccount:${SA}" --role="roles/iam.serviceAccountUser" --project "${PROJECT_ID}" || true
-          gcloud iam service-accounts add-iam-policy-binding "${RUNTIME_SA2}" \
-            --member="serviceAccount:${SA}" --role="roles/iam.serviceAccountUser" --project "${PROJECT_ID}" || true
+          # 런타임 SA 사용 권한
+          gcloud iam service-accounts add-iam-policy-binding "${RUNTIME_SA1}" --member="serviceAccount:${SA}" --role="roles/iam.serviceAccountUser" --project "${PROJECT_ID}" || true
+          gcloud iam service-accounts add-iam-policy-binding "${RUNTIME_SA2}" --member="serviceAccount:${SA}" --role="roles/iam.serviceAccountUser" --project "${PROJECT_ID}" || true
 
-          # Cloud Build SA도 런타임 SA 사용 가능(환경에 따라 필요)
-          gcloud iam service-accounts add-iam-policy-binding "${RUNTIME_SA1}" \
-            --member="serviceAccount:${CLOUDBUILD_SA}" --role="roles/iam.serviceAccountUser" --project "${PROJECT_ID}" || true
-          gcloud iam service-accounts add-iam-policy-binding "${RUNTIME_SA2}" \
-            --member="serviceAccount:${CLOUDBUILD_SA}" --role="roles/iam.serviceAccountUser" --project "${PROJECT_ID}" || true
+          # Cloud Build SA도 런타임 SA 사용 권한(환경에 따라 필요)
+          gcloud iam service-accounts add-iam-policy-binding "${RUNTIME_SA1}" --member="serviceAccount:${CLOUDBUILD_SA}" --role="roles/iam.serviceAccountUser" --project "${PROJECT_ID}" || true
+          gcloud iam service-accounts add-iam-policy-binding "${RUNTIME_SA2}" --member="serviceAccount:${CLOUDBUILD_SA}" --role="roles/iam.serviceAccountUser" --project "${PROJECT_ID}" || true
 
-  # 2) 실제 배포 (배포용 SA로 Firebase CLI 인증) — gcloud 불필요
+  # 2) 실제 배포 (배포 SA JSON으로 Firebase CLI 인증) — gcloud 불필요
   deploy:
     needs: [bootstrap]
     runs-on: ubuntu-latest
     env:
       FIREBASE_PROJECT_ID: ${{ secrets.FIREBASE_PROJECT_ID }}
       OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+
     steps:
+      - name: Check required secrets (deploy)
+        run: |
+          [ -n "${{ secrets.GCP_SA_KEY }}" ]           || { echo "::error::Missing secret GCP_SA_KEY"; exit 1; }
+          [ -n "${{ secrets.FIREBASE_PROJECT_ID }}" ]  || { echo "::error::Missing secret FIREBASE_PROJECT_ID"; exit 1; }
+
       - name: Checkout
         uses: actions/checkout@v4
 
       - name: Auth as DEPLOY SA (ADC for Firebase CLI)
         uses: google-github-actions/auth@v2
         with:
-          credentials_json: ${{ secrets.GCP_SA_KEY }}
+          credentials_json: ${{ secrets.GCP_SA_KEY }}   # 👈 반드시 명시
           create_credentials_file: true
           export_environment_variables: true
 
