@@ -4,80 +4,96 @@ import { onDocumentWritten } from "firebase-functions/v2/firestore";
 import * as logger from "firebase-functions/logger";
 import OpenAI from "openai";
 import puppeteer from "puppeteer";
+import { defineSecret } from "firebase-functions/params"; // ⬅️ 추가
 
 if (!admin.apps.length) admin.initializeApp();
 const db = admin.firestore();
 const bucket = admin.storage().bucket();
 
 // ---------- 공통 ----------
-const oa = process.env.OPENAI_API_KEY ? new OpenAI({ apiKey: process.env.OPENAI_API_KEY }) : null;
+const OPENAI_API_KEY = defineSecret("OPENAI_API_KEY"); // ⬅️ 추가
 const money = (n?: number) => (n ?? 0).toLocaleString();
 
 // ---------- 1) 견적 번호 발급 ----------
-export const newQuoteNumber = onCall<{ owner?: string; client?: string }>(async (req) => {
-  const now = new Date();
-  const yy = now.getFullYear().toString().slice(-2);
-  const yearRef = db.collection("counters").doc(yy);
+export const newQuoteNumber = onCall(
+  { region: "asia-northeast3" },                                  // ⬅️ 리전 고정
+  async (req: { data: { owner?: string; client?: string } }) => {
+    const now = new Date();
+    const yy = now.getFullYear().toString().slice(-2);
+    const yearRef = db.collection("counters").doc(yy);
 
-  const { seq, quoteNo } = await db.runTransaction(async (tx) => {
-    const s = await tx.get(yearRef);
-    const cur = s.exists ? (s.data()!.seq as number) : 0;
-    const next = cur + 1;
-    tx.set(yearRef, { seq: next }, { merge: true });
-    return { seq: next, quoteNo: `${yy}-${next}-1` };
-  });
-
-  const ref = await db.collection("quotes").add({
-    year: yy,
-    seq,
-    subSeq: 1,
-    quoteNo,
-    date: admin.firestore.Timestamp.fromDate(now),
-    owner: req.data?.owner ?? "",
-    client: req.data?.client ?? "",
-    status: "draft",
-  });
-
-  return { id: ref.id, quoteNo };
-});
-
-export const newRevisionNumber = onCall<{ quoteId: string }>(async (req) => {
-  const qRef = db.collection("quotes").doc(req.data.quoteId);
-  const { newNo } = await db.runTransaction(async (tx) => {
-    const s = await tx.get(qRef);
-    if (!s.exists) throw new Error("quote not found");
-    const d = s.data()!;
-    const sub = (d.subSeq || 1) + 1;
-    const newNo = `${d.year}-${d.seq}-${sub}`;
-    tx.update(qRef, {
-      subSeq: sub,
-      quoteNo: newNo,
-      date: admin.firestore.Timestamp.now(),
-      status: "revised",
+    const { seq, quoteNo } = await db.runTransaction(async (tx) => {
+      const s = await tx.get(yearRef);
+      const cur = s.exists ? (s.data()!.seq as number) : 0;
+      const next = cur + 1;
+      tx.set(yearRef, { seq: next }, { merge: true });
+      return { seq: next, quoteNo: `${yy}-${next}-1` };
     });
-    return { newNo };
-  });
-  return { quoteNo: newNo };
-});
+
+    const ref = await db.collection("quotes").add({
+      year: yy,
+      seq,
+      subSeq: 1,
+      quoteNo,
+      date: admin.firestore.Timestamp.fromDate(now),
+      owner: req.data?.owner ?? "",
+      client: req.data?.client ?? "",
+      status: "draft",
+    });
+
+    return { id: ref.id, quoteNo };
+  }
+);
+
+export const newRevisionNumber = onCall(
+  { region: "asia-northeast3" },                                  // ⬅️ 리전 고정
+  async (req: { data: { quoteId: string } }) => {
+    const qRef = db.collection("quotes").doc(req.data.quoteId);
+    const { newNo } = await db.runTransaction(async (tx) => {
+      const s = await tx.get(qRef);
+      if (!s.exists) throw new Error("quote not found");
+      const d = s.data()!;
+      const sub = (d.subSeq || 1) + 1;
+      const newNo = `${d.year}-${d.seq}-${sub}`;
+      tx.update(qRef, {
+        subSeq: sub,
+        quoteNo: newNo,
+        date: admin.firestore.Timestamp.now(),
+        status: "revised",
+      });
+      return { newNo };
+    });
+    return { quoteNo: newNo };
+  }
+);
 
 // ---------- 2) AI: 자연어 -> 구조화 ----------
-export const aiNormalize = onCall<{ freeText: string }>(async (req) => {
-  if (!oa) return { data: {} };
-  const prompt = `다음 견적 요청 문장을 JSON으로 구조화.
+export const aiNormalize = onCall(
+  {
+    region: "asia-northeast3",
+    secrets: [OPENAI_API_KEY],         // ⬅️ 바인딩
+    timeoutSeconds: 60,
+    memory: "512MiB",
+  },
+  async (req: { data: { freeText: string } }) => {
+    const client = new OpenAI({ apiKey: OPENAI_API_KEY.value() }); // ⬅️ 시크릿 사용
+    const prompt = `다음 견적 요청 문장을 JSON으로 구조화.
 필드: client, model, items[{qty, description, unitPrice?}],
 installed[], paid[], extra[], payTerms, deliveryTerms, memo, owner?
 숫자는 정수/원, 모르면 생략. JSON만 출력.
 
 문장:
 ${req.data.freeText}`;
-  const r = await oa.chat.completions.create({
-    model: "gpt-4o-mini",
-    temperature: 0.2,
-    messages: [{ role: "user", content: prompt }],
-  });
-  const text = r.choices[0]?.message?.content || "{}";
-  return { data: JSON.parse(text) };
-});
+
+    const r = await client.chat.completions.create({
+      model: "gpt-4o-mini",
+      temperature: 0.2,
+      messages: [{ role: "user", content: prompt }],
+    });
+    const text = r.choices[0]?.message?.content || "{}";
+    return { data: JSON.parse(text) };
+  }
+);
 
 // ---------- 3) HTML 템플릿 -> PDF/PNG ----------
 function rows(arr: any[], cols: string[]) {
@@ -122,35 +138,45 @@ ${q.memo?`<div>비고: ${q.memo}</div>`:""}
 </body></html>`;
 }
 
-export const generatePdfAndPng = onCall<{ quoteId: string }>(async (req) => {
-  const ref = db.collection("quotes").doc(req.data.quoteId);
-  const s = await ref.get();
-  if (!s.exists) throw new Error("quote not found");
-  const q = s.data()!;
-  const html = renderHtml(q);
+export const generatePdfAndPng = onCall(
+  {
+    region: "asia-northeast3",
+    timeoutSeconds: 120,                 // ⬅️ 여유
+    memory: "1GiB",                      // ⬅️ 여유
+  },
+  async (req: { data: { quoteId: string } }) => {
+    const ref = db.collection("quotes").doc(req.data.quoteId);
+    const s = await ref.get();
+    if (!s.exists) throw new Error("quote not found");
+    const q = s.data()!;
+    const html = renderHtml(q);
 
-  const browser = await puppeteer.launch({ headless: "new" });
-  const page = await browser.newPage();
-  await page.setContent(html, { waitUntil: "networkidle0" });
+    const browser = await puppeteer.launch({
+      headless: "new",
+      args: ["--no-sandbox","--disable-setuid-sandbox"], // ⬅️ GCF 안전 옵션
+    });
+    const page = await browser.newPage();
+    await page.setContent(html, { waitUntil: "networkidle0" });
 
-  const pdfBuf = await page.pdf({ format: "A4", printBackground: true, margin: { top:"14mm", bottom:"14mm", left:"14mm", right:"14mm" } });
-  const pngBuf = await page.screenshot({ type: "png", fullPage: true });
-  await browser.close();
+    const pdfBuf = await page.pdf({ format: "A4", printBackground: true, margin: { top:"14mm", bottom:"14mm", left:"14mm", right:"14mm" } });
+    const pngBuf = await page.screenshot({ type: "png", fullPage: true });
+    await browser.close();
 
-  const safe = (s: string) => (s||"").replace(/[^\w가-힣.-]/g,"_");
-  const base = `${safe(q.quoteNo)}_${safe(q.client)}_${safe(q.model)}`;
-  const pdfPath = `quotes/${base}.pdf`;
-  const pngPath = `quotes/${base}.png`;
+    const safe = (s: string) => (s||"").replace(/[^\w가-힣.-]/g,"_");
+    const base = `${safe(q.quoteNo)}_${safe(q.client)}_${safe(q.model)}`;
+    const pdfPath = `quotes/${base}.pdf`;
+    const pngPath = `quotes/${base}.png`;
 
-  await bucket.file(pdfPath).save(pdfBuf, { contentType: "application/pdf" });
-  await bucket.file(pngPath).save(pngBuf, { contentType: "image/png" });
+    await bucket.file(pdfPath).save(pdfBuf, { contentType: "application/pdf" });
+    await bucket.file(pngPath).save(pngBuf, { contentType: "image/png" });
 
-  const [pdfUrl] = await bucket.file(pdfPath).getSignedUrl({ action:"read", expires: Date.now()+1000*60*60*24*30 });
-  const [pngUrl] = await bucket.file(pngPath).getSignedUrl({ action:"read", expires: Date.now()+1000*60*60*24*30 });
+    const [pdfUrl] = await bucket.file(pdfPath).getSignedUrl({ action:"read", expires: Date.now()+1000*60*60*24*30 });
+    const [pngUrl] = await bucket.file(pngPath).getSignedUrl({ action:"read", expires: Date.now()+1000*60*60*24*30 });
 
-  await ref.update({ pdfUrl, pngUrl, status: "ready" });
-  return { pdfUrl, pngUrl };
-});
+    await ref.update({ pdfUrl, pngUrl, status: "ready" });
+    return { pdfUrl, pngUrl };
+  }
+);
 
 // ---------- 4) RAG 1단계: 임베딩 + 유사 견적 ----------
 function quoteToText(q:any){
@@ -171,9 +197,8 @@ function quoteToText(q:any){
   ].filter(Boolean).join("\n");
 }
 
-async function embed(text:string){
-  if(!oa) throw new Error("OPENAI_API_KEY missing");
-  const res = await oa.embeddings.create({ model:"text-embedding-3-small", input: text.slice(0,8000) });
+async function embed(text:string, client: OpenAI){
+  const res = await client.embeddings.create({ model:"text-embedding-3-small", input: text.slice(0,8000) });
   return res.data[0].embedding as unknown as number[];
 }
 function cosine(a:number[],b:number[]){
@@ -182,32 +207,51 @@ function cosine(a:number[],b:number[]){
   return dot/(Math.sqrt(na)*Math.sqrt(nb) || 1);
 }
 
-export const onQuoteWriteEmbed = onDocumentWritten("quotes/{id}", async (e) => {
-  const after = e.data?.after?.data();
-  if (!after) return;
-  try {
-    const vec = await embed(quoteToText(after));
-    await e.data!.after!.ref.update({ embedding: vec, updatedAt: admin.firestore.FieldValue.serverTimestamp() });
-  } catch (err:any) {
-    logger.error("[onQuoteWriteEmbed] embedding failed:", err?.message);
+export const onQuoteWriteEmbed = onDocumentWritten(
+  {
+    region: "asia-northeast3",
+    secrets: [OPENAI_API_KEY],           // ⬅️ 바인딩
+    timeoutSeconds: 120,
+    memory: "512MiB",
+  },
+  "quotes/{id}",
+  async (e) => {
+    const after = e.data?.after?.data();
+    if (!after) return;
+    try {
+      const client = new OpenAI({ apiKey: OPENAI_API_KEY.value() }); // ⬅️ 시크릿 사용
+      const vec = await embed(quoteToText(after), client);
+      await e.data!.after!.ref.update({ embedding: vec, updatedAt: admin.firestore.FieldValue.serverTimestamp() });
+    } catch (err:any) {
+      logger.error("[onQuoteWriteEmbed] embedding failed:", err?.message);
+    }
   }
-});
+);
 
-export const similarQuotes = onCall<{ query?: string; limit?: number }>(async (req) => {
-  const q = (req.data?.query||"").trim();
-  if(!q) return { items: [] };
-  const qVec = await embed(q);
+export const similarQuotes = onCall(
+  {
+    region: "asia-northeast3",
+    secrets: [OPENAI_API_KEY],           // ⬅️ 바인딩
+    timeoutSeconds: 60,
+    memory: "512MiB",
+  },
+  async (req: { data: { query?: string; limit?: number } }) => {
+    const q = (req.data?.query||"").trim();
+    if(!q) return { items: [] };
+    const client = new OpenAI({ apiKey: OPENAI_API_KEY.value() });  // ⬅️ 시크릿 사용
+    const qVec = await embed(q, client);
 
-  const snaps = await db.collection("quotes").orderBy("date","desc").limit(200).get();
-  type Rank = { id:string; quoteNo:string; client?:string; model?:string; grandTotal?:number; date?:any; score:number };
-  const ranks: Rank[] = [];
-  snaps.forEach(s=>{
-    const d = s.data()||{};
-    if(!d.embedding) return;
-    const score = cosine(qVec, d.embedding);
-    ranks.push({ id: s.id, quoteNo: d.quoteNo||"", client:d.client, model:d.model, grandTotal:d.grandTotal, date:d.date, score });
-  });
-  ranks.sort((a,b)=>b.score-a.score);
-  const top = ranks.slice(0, req.data?.limit ?? 5).map(r=>({ ...r, score: Number(r.score.toFixed(4)) }));
-  return { items: top };
-});
+    const snaps = await db.collection("quotes").orderBy("date","desc").limit(200).get();
+    type Rank = { id:string; quoteNo:string; client?:string; model?:string; grandTotal?:number; date?:any; score:number };
+    const ranks: Rank[] = [];
+    snaps.forEach(s=>{
+      const d = s.data()||{};
+      if(!d.embedding) return;
+      const score = cosine(qVec, d.embedding);
+      ranks.push({ id: s.id, quoteNo: d.quoteNo||"", client:d.client, model:d.model, grandTotal:d.grandTotal, date:d.date, score });
+    });
+    ranks.sort((a,b)=>b.score-a.score);
+    const top = ranks.slice(0, req.data?.limit ?? 5).map(r=>({ ...r, score: Number(r.score.toFixed(4)) }));
+    return { items: top };
+  }
+);
