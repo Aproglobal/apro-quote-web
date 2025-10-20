@@ -1,9 +1,17 @@
+# .github/workflows/deploy.yml
 name: Deploy to Firebase (Hosting + Functions + Rules)
 
 on:
   push:
     branches: [ "main" ]
   workflow_dispatch: {}
+
+concurrency:
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
 
 jobs:
   deploy:
@@ -19,31 +27,34 @@ jobs:
       - name: Setup Node
         uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: 20
+          cache: npm
 
       - name: Authenticate to Google Cloud
         uses: google-github-actions/auth@v2
         with:
           credentials_json: ${{ secrets.GCP_SA_KEY }}
+          create_credentials_file: true
+          export_environment_variables: true
 
       - name: Setup gcloud SDK
         uses: google-github-actions/setup-gcloud@v2
 
-      # ✅ 프로젝트 컨텍스트 고정 + 검증
+      # ✅ 프로젝트 컨텍스트 고정(권한 없으면 실패하지 않도록 || true)
       - name: Set gcloud project (hard set)
-        run: gcloud config set project "${FIREBASE_PROJECT_ID}"
+        run: gcloud config set project "${FIREBASE_PROJECT_ID}" || true
 
-      - name: Verify project & principal
+      - name: Verify project & principal (non-blocking)
         run: |
           gcloud config list
           gcloud auth list
-          gcloud projects describe "${FIREBASE_PROJECT_ID}" --format="value(projectId,projectNumber)"
+          gcloud projects describe "${FIREBASE_PROJECT_ID}" --format="value(projectId,projectNumber)" || true
 
       - name: Install Firebase CLI
-        run: npm i -g firebase-tools
+        run: npm i -g firebase-tools@latest
 
-      # ▶︎ 권한 되면 유지, 아니면 콘솔에서 Enable 후 이 스텝 제거/완화( || true )
-      - name: Enable required Google APIs
+      # ▶︎ API Enable은 1회 콘솔에서 하는 것을 권장. 필요 시 주석 해제하되 실패해도 파이프라인은 진행.
+      - name: Enable required Google APIs (optional)
         run: |
           gcloud services enable \
             firestore.googleapis.com \
@@ -53,7 +64,7 @@ jobs:
             artifactregistry.googleapis.com \
             secretmanager.googleapis.com \
             storage.googleapis.com \
-            --project "${FIREBASE_PROJECT_ID}"
+            --project "${FIREBASE_PROJECT_ID}" || true
 
       - name: Patch .firebaserc (optional)
         run: |
@@ -62,9 +73,14 @@ jobs:
           fi
 
       - name: Deploy Firestore Rules
+        env:
+          GOOGLE_APPLICATION_CREDENTIALS: ${{ env.GOOGLE_GHA_CREDS_PATH }}
         run: firebase deploy --only firestore:rules --project "${FIREBASE_PROJECT_ID}"
 
+      # ⚠️ 매 실행마다 새 비전이 생길 수 있음. 필요 없으면 주석 처리 가능.
       - name: Set Functions Secret (OPENAI_API_KEY)
+        env:
+          GOOGLE_APPLICATION_CREDENTIALS: ${{ env.GOOGLE_GHA_CREDS_PATH }}
         run: |
           firebase functions:secrets:set OPENAI_API_KEY \
             --project "${FIREBASE_PROJECT_ID}" \
@@ -80,6 +96,8 @@ jobs:
         run: npm run build
 
       - name: Deploy Functions
+        env:
+          GOOGLE_APPLICATION_CREDENTIALS: ${{ env.GOOGLE_GHA_CREDS_PATH }}
         run: firebase deploy --only functions --project "${FIREBASE_PROJECT_ID}"
 
       - name: Install deps (web)
@@ -90,4 +108,6 @@ jobs:
         run: npm run build
 
       - name: Deploy Hosting
+        env:
+          GOOGLE_APPLICATION_CREDENTIALS: ${{ env.GOOGLE_GHA_CREDS_PATH }}
         run: firebase deploy --only hosting --project "${FIREBASE_PROJECT_ID}"
