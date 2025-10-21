@@ -1,27 +1,27 @@
 # .github/workflows/deploy.yml
-name: CI: UI deps PR & Firebase Deploy
+name: "CI: UI deps PR & Firebase Deploy"
 
 on:
   push:
-    branches: [ "main" ]
+    branches: ["main"]
   workflow_dispatch:
     inputs:
       action:
         description: "무엇을 실행할까요?"
         type: choice
         required: true
-        default: "deploy"
+        default: deploy
         options:
           - deploy
           - ensure-ui-deps-pr
       pr_base:
         description: "PR 대상 브랜치 (기본 main)"
         required: false
-        default: "main"
+        default: main
 
 permissions:
-  contents: write          # PR/커밋 푸시용
-  pull-requests: write     # PR 생성/업데이트
+  contents: write
+  pull-requests: write
   packages: read
 
 concurrency:
@@ -33,7 +33,6 @@ env:
   OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
 
 jobs:
-  # ① UI 의존성 자동 설치 → 브랜치 푸시 → PR 생성
   ui_deps_pr:
     name: "Ensure UI deps & open PR"
     if: github.event_name == 'workflow_dispatch' && inputs.action == 'ensure-ui-deps-pr'
@@ -51,8 +50,8 @@ jobs:
       - name: Install UI deps (web)
         working-directory: web
         run: |
-          # 항상 설치해도 이미 있으면 up to date라 빠르게 끝납니다.
           npm i --save framer-motion lucide-react
+          # lock 업데이트 반영
           npm i --package-lock-only
 
       - name: Create Pull Request
@@ -63,7 +62,6 @@ jobs:
           title: "chore(web): add UI deps (framer-motion, lucide-react)"
           body: |
             LiveQuoteStudio.tsx에서 사용하는 framer-motion, lucide-react를 web/package.json에 추가합니다.
-            - npm install --save framer-motion lucide-react
           labels: dependencies
           base: ${{ inputs.pr_base }}
           branch: chore/ui-deps
@@ -72,13 +70,9 @@ jobs:
             web/package.json
             web/package-lock.json
 
-  # ② Firebase 배포(Functions + Hosting + Rules)
   deploy:
     name: "Deploy to Firebase"
-    # 수동 실행이면 action=deploy일 때만, 푸시(main)면 항상
-    if: |
-      github.event_name == 'push' ||
-      (github.event_name == 'workflow_dispatch' && inputs.action == 'deploy')
+    if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.action == 'deploy')
     runs-on: ubuntu-latest
 
     steps:
@@ -126,11 +120,9 @@ jobs:
             sed -i "s/\"default\": \".*\"/\"default\": \"${FIREBASE_PROJECT_ID}\"/g" .firebaserc || true
           fi
 
-      # ---- Firestore Rules ----
       - name: Deploy Firestore Rules
         run: firebase deploy --only firestore:rules --project "${FIREBASE_PROJECT_ID}"
 
-      # ---- Secret (Functions) ----
       - name: Set Functions Secret (OPENAI_API_KEY)
         if: env.OPENAI_API_KEY != ''
         run: |
@@ -138,7 +130,6 @@ jobs:
             --project "$FIREBASE_PROJECT_ID" \
             --non-interactive
 
-      # ---- Functions ----
       - name: Install deps (functions)
         working-directory: functions
         run: |
@@ -151,7 +142,6 @@ jobs:
       - name: Deploy Functions
         run: firebase deploy --only functions --project "${FIREBASE_PROJECT_ID}" --non-interactive
 
-      # ---- Web (Vite → Hosting) ----
       - name: Install deps (web)
         working-directory: web
         run: |
