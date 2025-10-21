@@ -20,7 +20,7 @@ jobs:
     env:
       FIREBASE_PROJECT_ID: ${{ secrets.FIREBASE_PROJECT_ID }}
       OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-      PR_TOKEN: ${{ secrets.PR_TOKEN || github.token }}
+      PR_TOKEN: ${{ secrets.PR_TOKEN || secrets.GITHUB_TOKEN }}
 
     steps:
       - name: Checkout
@@ -107,7 +107,7 @@ jobs:
             if(!has){(pkg.dependencies=pkg.dependencies||{})[k]=need[k];dirty=true;console.log('[add]',k+'@'+need[k]);}
           }
           if(dirty){fs.writeFileSync(f,JSON.stringify(pkg,null,2)+'\n');process.exit(42)}else{console.log('UI deps OK')}"
-      
+
       - name: Generate lockfile (only when deps added)
         if: ${{ steps.ensure_ui_deps.outcome == 'failure' }}
         working-directory: web
@@ -132,8 +132,8 @@ jobs:
         uses: peter-evans/create-pull-request@v6
         with:
           token: ${{ env.PR_TOKEN }}
-          commit-message: chore(web): add UI deps (framer-motion, lucide-react) [skip ci]
-          title: chore(web): add UI deps (framer-motion, lucide-react)
+          commit-message: "chore(web): add UI deps (framer-motion, lucide-react) [skip ci]"
+          title: "chore(web): add UI deps (framer-motion, lucide-react)"
           body: |
             CI가 web 빌드 중 필요한 UI 의존성을 감지하여 package.json과 lock 파일을 추가/갱신했습니다.
             - framer-motion
