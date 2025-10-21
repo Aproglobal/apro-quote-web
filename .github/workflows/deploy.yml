@@ -17,10 +17,8 @@ jobs:
       #   - FIREBASE_PROJECT_ID  (예: apro-quote-web-475705)
       #   - GCP_SA_KEY           (github-deployer 서비스계정 키 JSON)
       FIREBASE_PROJECT_ID: ${{ secrets.FIREBASE_PROJECT_ID }}
-      # 프런트가 리포 루트가 아니면 여기 경로 바꿔줘 (예: web)
+      # 기본값은 루트(.)이지만, 아래 단계에서 자동 탐지됨
       FRONTEND_DIR: .
-      # Puppeteer를 CI에서 건너뛰려면 주석 해제 (Functions 런타임에서 다시 설치됨)
-      # PUPPETEER_SKIP_DOWNLOAD: "true"
 
     steps:
       - name: Checkout
@@ -61,22 +59,37 @@ jobs:
           npm config set fetch-timeout 600000
           npm config set registry "https://registry.npmjs.org/"
 
-      # ====== 프런트엔드 설치/빌드 (FRONTEND_DIR에 package.json이 있을 때만) ======
-      - name: Install deps (web)
+      # ====== 프런트엔드 디렉터리 자동 탐지 (. / web / frontend / app / client) ======
+      - name: Detect frontend directory
+        id: detect-frontend
         run: |
-          if [ -f "${FRONTEND_DIR}/package.json" ]; then
-            (cd "${FRONTEND_DIR}" && npm ci)
+          set -e
+          CANDIDATES=("$FRONTEND_DIR" "web" "frontend" "app" "client")
+          DETECTED=""
+          for d in "${CANDIDATES[@]}"; do
+            if [ -f "$d/package.json" ]; then
+              DETECTED="$d"
+              break
+            fi
+          done
+          if [ -n "$DETECTED" ]; then
+            echo "Detected frontend at: $DETECTED"
+            echo "FRONTEND_DIR=$DETECTED" >> "$GITHUB_ENV"
           else
-            echo "No package.json in ${FRONTEND_DIR} — skipping web install."
+            echo "No frontend package.json found. Will create a placeholder site."
+            echo "FRONTEND_DIR=" >> "$GITHUB_ENV"
           fi
 
-      - name: Build (web)
+      # ====== 프런트엔드 의존성 설치/빌드 (발견됐을 때만) ======
+      - name: Install deps (web)
+        if: env.FRONTEND_DIR != ''
         run: |
-          if [ -f "${FRONTEND_DIR}/package.json" ]; then
-            (cd "${FRONTEND_DIR}" && npm run build)
-          else
-            echo "No package.json in ${FRONTEND_DIR} — skipping web build."
-          fi
+          (cd "$FRONTEND_DIR" && npm ci)
+
+      - name: Build (web)
+        if: env.FRONTEND_DIR != ''
+        run: |
+          (cd "$FRONTEND_DIR" && npm run build)
 
       # ---------- functions: lockfile 먼저 생성 ----------
       - name: Generate ephemeral lockfile (functions)
@@ -124,6 +137,8 @@ jobs:
             secretmanager.googleapis.com \
             run.googleapis.com \
             eventarc.googleapis.com \
+            pubsub.googleapis.com \
+            storage.googleapis.com \
             --project "${FIREBASE_PROJECT_ID}"
 
       # ---------- 런타임 서비스계정에 Secret 접근권 ----------
@@ -135,11 +150,48 @@ jobs:
             --member="serviceAccount:${RUNTIME_SA}" \
             --role="roles/secretmanager.secretAccessor"
 
-          # (겸용) App Engine 기본 SA도 시도(없으면 무시)
           APPSPOT_SA="${FIREBASE_PROJECT_ID}@appspot.gserviceaccount.com"
           gcloud projects add-iam-policy-binding "${FIREBASE_PROJECT_ID}" \
             --member="serviceAccount:${APPSPOT_SA}" \
             --role="roles/secretmanager.secretAccessor" || true
+
+      # ====== Hosting용 빌드 폴더 보장 ======
+      # - CRA:   <frontend>/build
+      # - Vite:  <frontend>/dist
+      # - Next:  <frontend>/out  (next export 기준)
+      # 없으면 임시 index.html 생성
+      - name: Ensure Hosting build folder
+        run: |
+          set -e
+          SRC=""
+          if [ -n "$FRONTEND_DIR" ] && [ -d "$FRONTEND_DIR/build" ]; then SRC="$FRONTEND_DIR/build"; fi
+          if [ -z "$SRC" ] && [ -n "$FRONTEND_DIR" ] && [ -d "$FRONTEND_DIR/dist" ]; then SRC="$FRONTEND_DIR/dist"; fi
+          if [ -z "$SRC" ] && [ -n "$FRONTEND_DIR" ] && [ -d "$FRONTEND_DIR/out" ]; then SRC="$FRONTEND_DIR/out"; fi
+
+          rm -rf build
+          if [ -n "$SRC" ]; then
+            echo "Using frontend build from: $SRC"
+            # 심볼릭 링크가 안되면 복사
+            ln -s "$SRC" build 2>/dev/null || { mkdir -p build && rsync -a "$SRC/." build/; }
+          else
+            echo "No frontend output found. Creating a placeholder site."
+            mkdir -p build
+            cat > build/index.html <<'HTML'
+            <!doctype html>
+            <meta charset="utf-8" />
+            <meta name="viewport" content="width=device-width,initial-scale=1" />
+            <title>Firebase Hosting is up</title>
+            <style>
+              body{font-family:system-ui, -apple-system, Segoe UI, Roboto, sans-serif; margin:0;display:grid;place-items:center;height:100vh}
+              .card{padding:32px;border:1px solid #e5e7eb;border-radius:16px;box-shadow:0 10px 15px rgba(0,0,0,.05)}
+            </style>
+            <div class="card">
+              <h1>🚀 Hosting OK</h1>
+              <p>배포 성공! 프런트 빌드를 연결하면 여기가 앱의 루트가 됩니다.</p>
+            </div>
+            HTML
+          fi
+          ls -alh build | head -n 20
 
       # ---------- Deploy (Functions + Hosting) ----------
       - name: Deploy Firebase
