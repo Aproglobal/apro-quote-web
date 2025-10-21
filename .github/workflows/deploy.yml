@@ -1,8 +1,8 @@
-name: Deploy Firebase Functions
+name: Deploy Firebase (Functions & Hosting)
 
 on:
   push:
-    branches: [ "main" ]
+    branches: ["main"]
   workflow_dispatch: {}
 
 jobs:
@@ -17,7 +17,9 @@ jobs:
       #   - FIREBASE_PROJECT_ID  (예: apro-quote-web-475705)
       #   - GCP_SA_KEY           (github-deployer 서비스계정 키 JSON)
       FIREBASE_PROJECT_ID: ${{ secrets.FIREBASE_PROJECT_ID }}
-      # PUPPETEER를 CI에서 굳이 설치 안 하려면 주석 해제(최종 빌드는 GCP에서 다시 설치됨)
+      # 프런트가 리포 루트가 아니면 여기 경로 바꿔줘 (예: web)
+      FRONTEND_DIR: .
+      # Puppeteer를 CI에서 건너뛰려면 주석 해제 (Functions 런타임에서 다시 설치됨)
       # PUPPETEER_SKIP_DOWNLOAD: "true"
 
     steps:
@@ -59,8 +61,25 @@ jobs:
           npm config set fetch-timeout 600000
           npm config set registry "https://registry.npmjs.org/"
 
-      # ---------- lockfile 먼저 생성 ----------
-      - name: Generate ephemeral lockfile
+      # ====== 프런트엔드 설치/빌드 (FRONTEND_DIR에 package.json이 있을 때만) ======
+      - name: Install deps (web)
+        run: |
+          if [ -f "${FRONTEND_DIR}/package.json" ]; then
+            (cd "${FRONTEND_DIR}" && npm ci)
+          else
+            echo "No package.json in ${FRONTEND_DIR} — skipping web install."
+          fi
+
+      - name: Build (web)
+        run: |
+          if [ -f "${FRONTEND_DIR}/package.json" ]; then
+            (cd "${FRONTEND_DIR}" && npm run build)
+          else
+            echo "No package.json in ${FRONTEND_DIR} — skipping web build."
+          fi
+
+      # ---------- functions: lockfile 먼저 생성 ----------
+      - name: Generate ephemeral lockfile (functions)
         working-directory: functions
         run: |
           for i in 1 2 3; do
@@ -70,7 +89,7 @@ jobs:
             }
           done
 
-      # ---------- ~/.npm 캐시를 lockfile 해시로 복구 ----------
+      # ---------- ~/.npm 캐시 (functions lockfile 기준) ----------
       - name: Restore npm cache
         uses: actions/cache@v4
         with:
@@ -79,7 +98,7 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-npm-
 
-      # ---------- 의존성 설치 ----------
+      # ---------- functions 의존성 설치/빌드 ----------
       - name: Install deps (functions) with retry
         working-directory: functions
         run: |
@@ -122,7 +141,7 @@ jobs:
             --member="serviceAccount:${APPSPOT_SA}" \
             --role="roles/secretmanager.secretAccessor" || true
 
-      # ---------- Deploy ----------
-      - name: Deploy Functions
+      # ---------- Deploy (Functions + Hosting) ----------
+      - name: Deploy Firebase
         run: |
-          firebase deploy --only functions --project "${FIREBASE_PROJECT_ID}" --force
+          firebase deploy --only functions,hosting --project "${FIREBASE_PROJECT_ID}" --force
