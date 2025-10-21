@@ -1,4 +1,4 @@
-name: Deploy Firebase (Functions + Hosting)
+name: Deploy to Firebase (Hosting + Functions + Rules)
 
 on:
   push:
@@ -8,11 +8,12 @@ on:
 jobs:
   deploy:
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      packages: read
 
     env:
+      # GitHub Secrets에 등록되어 있어야 함:
+      # - FIREBASE_PROJECT_ID  (예: apro-quote-web-475705)
+      # - GCP_SA_KEY           (서비스계정 키 JSON)
+      # - OPENAI_API_KEY       (선택: Functions에서 사용)
       FIREBASE_PROJECT_ID: ${{ secrets.FIREBASE_PROJECT_ID }}
       OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
 
@@ -20,19 +21,19 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup Node.js
+      - name: Setup Node
         uses: actions/setup-node@v4
         with:
           node-version: 20
 
-      - name: Auth to Google Cloud
+      - name: Authenticate to Google Cloud
         uses: google-github-actions/auth@v2
         with:
           credentials_json: ${{ secrets.GCP_SA_KEY }}
           create_credentials_file: true
           export_environment_variables: true
 
-      - name: Setup gcloud CLI
+      - name: Setup gcloud SDK
         uses: google-github-actions/setup-gcloud@v2
         with:
           project_id: ${{ env.FIREBASE_PROJECT_ID }}
@@ -61,39 +62,40 @@ jobs:
             sed -i "s/\"default\": \".*\"/\"default\": \"${FIREBASE_PROJECT_ID}\"/g" .firebaserc || true
           fi
 
+      # ---- Firestore Rules (선택) ----
       - name: Deploy Firestore Rules
         run: firebase deploy --only firestore:rules --project "${FIREBASE_PROJECT_ID}"
 
-      # -------- Functions --------
+      # ---- Secret 설정 (여기가 핵심 변경) ----
+      - name: Set Functions Secret (OPENAI_API_KEY)
+        if: env.OPENAI_API_KEY != ''
+        run: |
+          printf '%s' "$OPENAI_API_KEY" | firebase functions:secrets:set OPENAI_API_KEY \
+            --project "$FIREBASE_PROJECT_ID" \
+            --non-interactive
+
+      # ---- Functions ----
       - name: Install deps (functions)
         working-directory: functions
         run: |
-          if [ -f package-lock.json ]; then npm ci; else npm i; fi
+          if [ -f package-lock.json ]; then npm ci --no-audit --progress=false; else npm i; fi
 
-      - name: Build (functions)
+      - name: Build Functions
         working-directory: functions
         run: npm run build --if-present
 
-      - name: Set Functions Secret (OPENAI_API_KEY) if provided
-        run: |
-          if [ -n "${OPENAI_API_KEY}" ]; then
-            firebase functions:secrets:set OPENAI_API_KEY \
-              --project "${FIREBASE_PROJECT_ID}" \
-              --data "${OPENAI_API_KEY}"
-          else
-            echo "OPENAI_API_KEY not set; skipping secret."
-          fi
+      - name: Deploy Functions
+        run: firebase deploy --only functions --project "${FIREBASE_PROJECT_ID}" --non-interactive
 
-      # -------- Web (Vite in /web) --------
+      # ---- Web (Vite, web/dist로 빌드 → Hosting) ----
       - name: Install deps (web)
         working-directory: web
         run: |
-          if [ -f package-lock.json ]; then npm ci; else npm i; fi
+          if [ -f package-lock.json ]; then npm ci --no-audit --progress=false; else npm i; fi
 
-      - name: Build (web)
+      - name: Build Web
         working-directory: web
         run: npm run build
 
-      # -------- Deploy both --------
-      - name: Deploy Functions + Hosting
-        run: firebase deploy --only functions,hosting --project "${FIREBASE_PROJECT_ID}" --force
+      - name: Deploy Hosting
+        run: firebase deploy --only hosting --project "${FIREBASE_PROJECT_ID}" --non-interactive
