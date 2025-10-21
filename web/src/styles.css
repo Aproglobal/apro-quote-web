@@ -1,0 +1,22 @@
+:root{ --bg:#0b0d12; --card:#12161f; --ink:#e6e9ef; --muted:#9aa5b1; --brand:#3b82f6; --line:#2a3040 }
+*{ box-sizing:border-box }
+html,body,#root{ height:100% }
+body{ margin:0; background:var(--bg); color:var(--ink); font:14px/1.5 system-ui,AppleSDGothicNeo,Segoe UI,Roboto,Arial }
+.app{ max-width:1100px; margin:0 auto; padding:16px }
+.hdr{ display:flex; gap:10px; align-items:center; justify-content:space-between; flex-wrap:wrap; margin-bottom:12px }
+.card{ background:var(--card); border:1px solid var(--line); border-radius:14px; padding:14px; margin:10px 0; box-shadow:0 4px 10px rgba(0,0,0,.25) }
+.row{ display:grid; grid-template-columns:1fr 1fr; gap:10px }
+@media (max-width:720px){ .row{ grid-template-columns:1fr } }
+label{ display:flex; flex-direction:column; gap:6px; font-weight:600; color:var(--muted) }
+input,textarea,select{ width:100%; padding:10px 12px; border-radius:10px; border:1px solid var(--line); background:#0e121a; color:var(--ink) }
+textarea{ min-height:84px }
+.table{ width:100%; border-collapse:collapse; }
+.table th,.table td{ border:1px solid var(--line); padding:8px; text-align:left }
+.right{ text-align:right }
+.btns{ display:flex; gap:8px; flex-wrap:wrap }
+.btn{ background:var(--brand); border:none; color:#fff; padding:10px 12px; border-radius:10px; font-weight:700; cursor:pointer }
+.btn.secondary{ background:#334155 }
+.badge{ background:#1f2937; color:#cbd5e1; border:1px solid var(--line); border-radius:999px; padding:4px 10px; font-size:12px }
+.kv{ display:flex; gap:8px; align-items:center; flex-wrap:wrap }
+small.mono{ font-family:ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace; color:#a8b3c3 }
+hr.div{ border:0; border-top:1px dashed var(--line); margin:12px 0 }
