@@ -1,23 +1,10 @@
 # .github/workflows/deploy.yml
-name: "CI: UI deps PR & Firebase Deploy"
+name: "CI: Firebase Deploy + Auto UI Deps PR"
 
 on:
   push:
     branches: ["main"]
-  workflow_dispatch:
-    inputs:
-      action:
-        description: "무엇을 실행할까요?"
-        type: choice
-        required: true
-        default: deploy
-        options:
-          - deploy
-          - ensure-ui-deps-pr
-      pr_base:
-        description: "PR 대상 브랜치 (기본 main)"
-        required: false
-        default: main
+  workflow_dispatch: {}
 
 permissions:
   contents: write
@@ -33,46 +20,8 @@ env:
   OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
 
 jobs:
-  ui_deps_pr:
-    name: "Ensure UI deps & open PR"
-    if: github.event_name == 'workflow_dispatch' && inputs.action == 'ensure-ui-deps-pr'
-    runs-on: ubuntu-latest
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Setup Node
-        uses: actions/setup-node@v4
-        with:
-          node-version: 20
-
-      - name: Install UI deps (web)
-        working-directory: web
-        run: |
-          npm i --save framer-motion lucide-react
-          # lock 업데이트 반영
-          npm i --package-lock-only
-
-      - name: Create Pull Request
-        uses: peter-evans/create-pull-request@v6
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-          commit-message: "chore(web): add UI deps (framer-motion, lucide-react)"
-          title: "chore(web): add UI deps (framer-motion, lucide-react)"
-          body: |
-            LiveQuoteStudio.tsx에서 사용하는 framer-motion, lucide-react를 web/package.json에 추가합니다.
-          labels: dependencies
-          base: ${{ inputs.pr_base }}
-          branch: chore/ui-deps
-          branch-suffix: timestamp
-          add-paths: |
-            web/package.json
-            web/package-lock.json
-
   deploy:
     name: "Deploy to Firebase"
-    if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.action == 'deploy')
     runs-on: ubuntu-latest
 
     steps:
@@ -120,9 +69,11 @@ jobs:
             sed -i "s/\"default\": \".*\"/\"default\": \"${FIREBASE_PROJECT_ID}\"/g" .firebaserc || true
           fi
 
+      # ---------- Firestore Rules ----------
       - name: Deploy Firestore Rules
         run: firebase deploy --only firestore:rules --project "${FIREBASE_PROJECT_ID}"
 
+      # ---------- Functions ----------
       - name: Set Functions Secret (OPENAI_API_KEY)
         if: env.OPENAI_API_KEY != ''
         run: |
@@ -142,6 +93,43 @@ jobs:
       - name: Deploy Functions
         run: firebase deploy --only functions --project "${FIREBASE_PROJECT_ID}" --non-interactive
 
+      # ---------- Web ----------
+      # 0) UI 의존성 점검 및 package.json/lock만 갱신
+      - name: Ensure UI deps in web (framer-motion, lucide-react)
+        id: ensure_ui_deps
+        working-directory: web
+        continue-on-error: true
+        shell: bash
+        run: |
+          node - <<'JS'
+          const fs = require('fs');
+          const path = 'package.json';
+          const need = { "framer-motion": "^11.2.10", "lucide-react": "^0.460.0" };
+          const pkg = JSON.parse(fs.readFileSync(path,'utf8'));
+          let dirty = false;
+          for (const [name, ver] of Object.entries(need)) {
+            const has = (pkg.dependencies && pkg.dependencies[name]) || (pkg.devDependencies && pkg.devDependencies[name]);
+            if (!has) {
+              pkg.dependencies ||= {};
+              pkg.dependencies[name] = ver;
+              dirty = true;
+              console.log(`[add] ${name}@${ver}`);
+            }
+          }
+          if (dirty) {
+            fs.writeFileSync(path, JSON.stringify(pkg, null, 2) + '\n');
+            process.exit(42); // 표시용 비정상 종료 -> outcome=failure로 잡아 조건 분기
+          } else {
+            console.log('UI deps OK');
+          }
+          JS
+
+      - name: Update lock only (web) if deps were added
+        if: steps.ensure_ui_deps.outcome == 'failure'
+        working-directory: web
+        run: npm i --package-lock-only --no-audit --progress=false
+
+      # 1) 설치/빌드 (lock이 있으면 ci, 없으면 i)
       - name: Install deps (web)
         working-directory: web
         run: |
@@ -150,6 +138,26 @@ jobs:
       - name: Build Web
         working-directory: web
         run: npm run build
+
+      # 2) web/package.json 변경이 있었다면 자동 PR 생성 (한 워크플로우 내에서 처리)
+      - name: Create Pull Request for added UI deps
+        if: steps.ensure_ui_deps.outcome == 'failure'
+        uses: peter-evans/create-pull-request@v6
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          commit-message: "chore(web): add UI deps (framer-motion, lucide-react) [skip ci]"
+          title: "chore(web): add UI deps (framer-motion, lucide-react)"
+          body: |
+            CI가 web 빌드 시 필요한 UI 의존성을 감지하여 추가했습니다.
+            - framer-motion
+            - lucide-react
+          labels: dependencies
+          base: main
+          branch: chore/ui-deps
+          branch-suffix: timestamp
+          add-paths: |
+            web/package.json
+            web/package-lock.json
 
       - name: Deploy Hosting
         run: firebase deploy --only hosting --project "${FIREBASE_PROJECT_ID}" --non-interactive
