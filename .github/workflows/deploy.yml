@@ -124,4 +124,5 @@ jobs:
 
       # ---------- Deploy ----------
       - name: Deploy Functions
-        run: firebase deploy --only functions --project "${FIREBASE_PROJECT_ID}"
+  run: |
+    firebase deploy --only functions --project "$FIREBASE_PROJECT_ID" --force
