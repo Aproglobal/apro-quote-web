@@ -3,28 +3,23 @@ name: Deploy to Firebase (Hosting + Functions + Rules)
 on:
   push:
     branches: [ "main" ]
-  workflow_dispatch:
+  workflow_dispatch: {}
 
-# PR 자동 생성 액션을 위해 권한 부여
 permissions:
   contents: write
   pull-requests: write
 
-# 같은 브랜치에서 동시에 둘 이상 배포 방지
-concurrency: deploy-${{ github.ref }}
+concurrency:
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   deploy:
     runs-on: ubuntu-latest
 
     env:
-      # GitHub Secrets에 미리 등록
-      # - FIREBASE_PROJECT_ID (예: apro-quote-web-475705)
-      # - GCP_SA_KEY          (서비스계정 키 JSON)
-      # - OPENAI_API_KEY      (선택: Functions에서 사용)
       FIREBASE_PROJECT_ID: ${{ secrets.FIREBASE_PROJECT_ID }}
       OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-      # PR_TOKEN이 있으면 사용, 없으면 기본 GITHUB_TOKEN 사용
       PR_TOKEN: ${{ secrets.PR_TOKEN || github.token }}
 
     steps:
@@ -72,18 +67,18 @@ jobs:
             sed -i "s/\"default\": \".*\"/\"default\": \"${FIREBASE_PROJECT_ID}\"/g" .firebaserc || true
           fi
 
-      # ---------- Firestore Rules ----------
+      # ---- Firestore Rules ----
       - name: Deploy Firestore Rules
         run: firebase deploy --only firestore:rules --project "${FIREBASE_PROJECT_ID}"
 
-      # ---------- Secrets (Functions) ----------
+      # ---- Secret for Functions ----
       - name: Set Functions Secret (OPENAI_API_KEY)
-        if: env.OPENAI_API_KEY != ''
+        if: ${{ env.OPENAI_API_KEY != '' }}
         run: |
           printf '%s' "$OPENAI_API_KEY" | firebase functions:secrets:set OPENAI_API_KEY \
             --project "$FIREBASE_PROJECT_ID" --non-interactive
 
-      # ---------- Cloud Functions ----------
+      # ---- Functions ----
       - name: Install deps (functions)
         working-directory: functions
         run: |
@@ -96,39 +91,25 @@ jobs:
       - name: Deploy Functions
         run: firebase deploy --only functions --project "${FIREBASE_PROJECT_ID}" --non-interactive
 
-      # ---------- Web (Vite) ----------
-      # 필요 UI 의존성 자동 보정: 없으면 package.json 수정 후 '의도적 실패(42)' 반환
+      # ---- Web (Vite) ----
+      # 필요 UI deps 자동 추가: package.json 수정 시 의도적으로 종료코드 42
       - name: Ensure UI deps (framer-motion, lucide-react)
         id: ensure_ui_deps
         working-directory: web
         continue-on-error: true
-        run: |
-          node - <<'JS'
-          const fs = require('fs');
-          const path = 'package.json';
-          const need = { "framer-motion": "^11.2.10", "lucide-react": "^0.460.0" };
-          const pkg = JSON.parse(fs.readFileSync(path, 'utf8'));
-          let dirty = false;
-          for (const [name, ver] of Object.entries(need)) {
-            const has = (pkg.dependencies && pkg.dependencies[name]) || (pkg.devDependencies && pkg.devDependencies[name]);
-            if (!has) {
-              pkg.dependencies ||= {};
-              pkg.dependencies[name] = ver;
-              dirty = true;
-              console.log(`[add] ${name}@${ver}`);
-            }
+        run: >
+          node -e "const fs=require('fs');const f='package.json';
+          const pkg=JSON.parse(fs.readFileSync(f,'utf8'));
+          const need={'framer-motion':'^11.2.10','lucide-react':'^0.460.0'};
+          let dirty=false;
+          for(const k in need){
+            const has=(pkg.dependencies&&pkg.dependencies[k])||(pkg.devDependencies&&pkg.devDependencies[k]);
+            if(!has){(pkg.dependencies=pkg.dependencies||{})[k]=need[k];dirty=true;console.log('[add]',k+'@'+need[k]);}
           }
-          if (dirty) {
-            fs.writeFileSync(path, JSON.stringify(pkg, null, 2) + '\n');
-            process.exit(42); // 변경 발생: 뒤 단계 if 조건 분기에서 사용
-          } else {
-            console.log('UI deps OK');
-          }
-          JS
-
-      # 위 단계에서 package.json이 변경되었으면 lock 파일 생성
+          if(dirty){fs.writeFileSync(f,JSON.stringify(pkg,null,2)+'\n');process.exit(42)}else{console.log('UI deps OK')}"
+      
       - name: Generate lockfile (only when deps added)
-        if: steps.ensure_ui_deps.outcome == 'failure'
+        if: ${{ steps.ensure_ui_deps.outcome == 'failure' }}
         working-directory: web
         run: npm i --package-lock-only --no-audit --progress=false
 
@@ -141,13 +122,12 @@ jobs:
         working-directory: web
         run: npm run build
 
-      # ✅ PR 생성 전에 Hosting 배포를 먼저 수행 (PR 실패해도 배포 성공)
       - name: Deploy Hosting
         run: firebase deploy --only hosting --project "${FIREBASE_PROJECT_ID}" --non-interactive
 
-      # ---------- Optional: 자동 PR 생성 (조직 정책으로 막혀도 워크플로우는 성공) ----------
+      # ---- Optional: 자동 PR(조직 정책으로 막혀도 워크플로우 성공 유지) ----
       - name: Create Pull Request for added UI deps (optional)
-        if: steps.ensure_ui_deps.outcome == 'failure'
+        if: ${{ steps.ensure_ui_deps.outcome == 'failure' }}
         continue-on-error: true
         uses: peter-evans/create-pull-request@v6
         with:
@@ -155,7 +135,7 @@ jobs:
           commit-message: chore(web): add UI deps (framer-motion, lucide-react) [skip ci]
           title: chore(web): add UI deps (framer-motion, lucide-react)
           body: |
-            CI가 web 빌드 시 필요한 UI 의존성을 감지하여 package.json과 lock 파일을 추가/갱신했습니다.
+            CI가 web 빌드 중 필요한 UI 의존성을 감지하여 package.json과 lock 파일을 추가/갱신했습니다.
             - framer-motion
             - lucide-react
           labels: dependencies
