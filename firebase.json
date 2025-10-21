@@ -1,17 +1,10 @@
 {
-  "firestore": {
-    "rules": "firestore.rules"
-  },
+  "firestore": { "rules": "firestore.rules" },
   "hosting": {
-    "public": "build",
+    "public": "web/dist",
     "ignore": ["firebase.json", "**/.*", "**/node_modules/**"],
-    "rewrites": [
-      { "source": "**", "destination": "/index.html" }
-    ]
+    "cleanUrls": true,
+    "rewrites": [{ "source": "**", "destination": "/index.html" }]
   },
-  "functions": {
-    "source": "functions",
-    "runtime": "nodejs20",
-    "ignore": ["node_modules", ".git", "firebase-debug.log", "firebase-debug.*.log"]
-  }
+  "functions": { "source": "functions" }
 }
