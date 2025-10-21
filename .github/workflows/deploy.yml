@@ -1,21 +1,85 @@
-name: Deploy to Firebase (Hosting + Functions + Rules)
+# .github/workflows/deploy.yml
+name: CI: UI deps PR & Firebase Deploy
 
 on:
   push:
     branches: [ "main" ]
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      action:
+        description: "무엇을 실행할까요?"
+        type: choice
+        required: true
+        default: "deploy"
+        options:
+          - deploy
+          - ensure-ui-deps-pr
+      pr_base:
+        description: "PR 대상 브랜치 (기본 main)"
+        required: false
+        default: "main"
+
+permissions:
+  contents: write          # PR/커밋 푸시용
+  pull-requests: write     # PR 생성/업데이트
+  packages: read
+
+concurrency:
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  FIREBASE_PROJECT_ID: ${{ secrets.FIREBASE_PROJECT_ID }}
+  OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
 
 jobs:
-  deploy:
+  # ① UI 의존성 자동 설치 → 브랜치 푸시 → PR 생성
+  ui_deps_pr:
+    name: "Ensure UI deps & open PR"
+    if: github.event_name == 'workflow_dispatch' && inputs.action == 'ensure-ui-deps-pr'
     runs-on: ubuntu-latest
 
-    env:
-      # GitHub Secrets에 등록되어 있어야 함:
-      # - FIREBASE_PROJECT_ID  (예: apro-quote-web-475705)
-      # - GCP_SA_KEY           (서비스계정 키 JSON)
-      # - OPENAI_API_KEY       (선택: Functions에서 사용)
-      FIREBASE_PROJECT_ID: ${{ secrets.FIREBASE_PROJECT_ID }}
-      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install UI deps (web)
+        working-directory: web
+        run: |
+          # 항상 설치해도 이미 있으면 up to date라 빠르게 끝납니다.
+          npm i --save framer-motion lucide-react
+          npm i --package-lock-only
+
+      - name: Create Pull Request
+        uses: peter-evans/create-pull-request@v6
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          commit-message: "chore(web): add UI deps (framer-motion, lucide-react)"
+          title: "chore(web): add UI deps (framer-motion, lucide-react)"
+          body: |
+            LiveQuoteStudio.tsx에서 사용하는 framer-motion, lucide-react를 web/package.json에 추가합니다.
+            - npm install --save framer-motion lucide-react
+          labels: dependencies
+          base: ${{ inputs.pr_base }}
+          branch: chore/ui-deps
+          branch-suffix: timestamp
+          add-paths: |
+            web/package.json
+            web/package-lock.json
+
+  # ② Firebase 배포(Functions + Hosting + Rules)
+  deploy:
+    name: "Deploy to Firebase"
+    # 수동 실행이면 action=deploy일 때만, 푸시(main)면 항상
+    if: |
+      github.event_name == 'push' ||
+      (github.event_name == 'workflow_dispatch' && inputs.action == 'deploy')
+    runs-on: ubuntu-latest
 
     steps:
       - name: Checkout
@@ -62,11 +126,11 @@ jobs:
             sed -i "s/\"default\": \".*\"/\"default\": \"${FIREBASE_PROJECT_ID}\"/g" .firebaserc || true
           fi
 
-      # ---- Firestore Rules (선택) ----
+      # ---- Firestore Rules ----
       - name: Deploy Firestore Rules
         run: firebase deploy --only firestore:rules --project "${FIREBASE_PROJECT_ID}"
 
-      # ---- Secret 설정 (여기가 핵심 변경) ----
+      # ---- Secret (Functions) ----
       - name: Set Functions Secret (OPENAI_API_KEY)
         if: env.OPENAI_API_KEY != ''
         run: |
@@ -87,7 +151,7 @@ jobs:
       - name: Deploy Functions
         run: firebase deploy --only functions --project "${FIREBASE_PROJECT_ID}" --non-interactive
 
-      # ---- Web (Vite, web/dist로 빌드 → Hosting) ----
+      # ---- Web (Vite → Hosting) ----
       - name: Install deps (web)
         working-directory: web
         run: |
