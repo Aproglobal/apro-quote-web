@@ -14,24 +14,24 @@ jobs:
 
     env:
       # GitHub Secrets에 반드시 추가:
-      # FIREBASE_PROJECT_ID = apro-quote-web-475705
+      #   - FIREBASE_PROJECT_ID  (예: apro-quote-web-475705)
+      #   - GCP_SA_KEY           (github-deployer 서비스계정 키 JSON)
       FIREBASE_PROJECT_ID: ${{ secrets.FIREBASE_PROJECT_ID }}
-      # Puppeteer가 필요 없으면 주석 해제(네트워크/시간 절약)
+      # PUPPETEER를 CI에서 굳이 설치 안 하려면 주석 해제(최종 빌드는 GCP에서 다시 설치됨)
       # PUPPETEER_SKIP_DOWNLOAD: "true"
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup Node.js (no cache here)
+      - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: 20
 
       - name: Auth to Google Cloud
         uses: google-github-actions/auth@v2
         with:
-          # GitHub Secrets: GCP_SA_KEY = github-deployer 서비스계정 키 JSON
           credentials_json: ${{ secrets.GCP_SA_KEY }}
           create_credentials_file: true
           export_environment_variables: true
@@ -124,5 +124,5 @@ jobs:
 
       # ---------- Deploy ----------
       - name: Deploy Functions
-  run: |
-    firebase deploy --only functions --project "$FIREBASE_PROJECT_ID" --force
+        run: |
+          firebase deploy --only functions --project "${FIREBASE_PROJECT_ID}" --force
