@@ -1,0 +1,42 @@
+name: Add UI deps (framer-motion & lucide-react)
+
+on:
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  add-deps:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      # web/ 디렉토리에서 필요한 UI 패키지 설치 (package.json + lock 파일 갱신)
+      - name: Install UI deps in web/
+        working-directory: web
+        run: |
+          npm i -E framer-motion lucide-react
+
+      # 변경된 파일만 커밋/PR 생성
+      - name: Create PR
+        uses: peter-evans/create-pull-request@v6
+        with:
+          commit-message: "chore(web): add framer-motion & lucide-react for LiveQuoteStudio"
+          title: "chore(web): add framer-motion & lucide-react"
+          body: |
+            Adds missing UI deps so `LiveQuoteStudio.tsx` builds cleanly.
+            - Install: framer-motion, lucide-react
+            - Scope: web/package.json, package-lock.json
+          branch: chore/add-ui-deps
+          delete-branch: true
+          add-paths: |
+            web/package.json
+            web/package-lock.json
