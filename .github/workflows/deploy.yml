@@ -22,16 +22,36 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      # ---- Lockfile 자동 감지 (있으면 캐시, 없으면 캐시 비활성) ----
+      - name: Find lockfiles
+        id: locks
+        shell: bash
+        run: |
+          paths=""
+          for p in package-lock.json web/package-lock.json functions/package-lock.json; do
+            if [ -f "$p" ]; then
+              paths="${paths}${p}"$'\n'
+            fi
+          done
+          if [ -n "$paths" ]; then
+            echo "cache=npm" >> "$GITHUB_OUTPUT"
+            {
+              echo "paths<<EOF"
+              printf "%s" "$paths"
+              echo
+              echo "EOF"
+            } >> "$GITHUB_OUTPUT"
+          else
+            echo "cache=" >> "$GITHUB_OUTPUT"
+            echo "paths=" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
           node-version: 20
-          cache: npm
-          # 루트/웹/펑션즈 모두 캐시 고려
-          cache-dependency-path: |
-            package-lock.json
-            web/package-lock.json
-            functions/package-lock.json
+          cache: ${{ steps.locks.outputs.cache }}
+          cache-dependency-path: ${{ steps.locks.outputs.paths }}
 
       # ---- GCP / Firebase ----
       - name: Auth to Google Cloud
@@ -92,7 +112,7 @@ jobs:
       - name: Deploy Cloud Functions
         run: firebase deploy --only functions --project "$FIREBASE_PROJECT_ID" --non-interactive
 
-      # ---- Detect UI directory (web/ or .) ----
+      # ---- UI 디렉토리 자동 감지 (web/ 또는 .) ----
       - name: Detect UI dir
         id: detect_ui
         shell: bash
@@ -105,32 +125,30 @@ jobs:
             echo "No UI package.json found"; exit 1
           fi
 
-      # ---- Install deps (lockfile 있으면 ci, 없으면 i) ----
+      # ---- UI deps 설치: lockfile 있으면 ci, 없으면 i ----
       - name: Install deps (UI)
         working-directory: ${{ steps.detect_ui.outputs.dir }}
         run: |
           if [ -f package-lock.json ]; then
             npm ci --no-audit --progress=false
           else
-            npm i --no-audit --progress=false
+            npm i  --no-audit --progress=false
           fi
 
       - name: Build (UI)
         working-directory: ${{ steps.detect_ui.outputs.dir }}
         run: npm run build
 
-      # ---- Match build output to firebase.json hosting.public ----
+      # ---- firebase.json hosting.public과 빌드 산출물 정렬 ----
       - name: Normalize hosting public path
         id: norm_hosting
         shell: bash
         run: |
-          # 1) firebase.json에서 hosting.public 읽기 (없으면 기본값 결정)
           HOSTING_PUBLIC=$(node -e "const f=require('fs');let p='';try{const j=JSON.parse(f.readFileSync('firebase.json','utf8'));if(j.hosting&&j.hosting.public)p=j.hosting.public;}catch{};process.stdout.write(p||'');")
           UI_DIR="${{ steps.detect_ui.outputs.dir }}"
           BUILD_DIST="$UI_DIR/dist"
 
           if [ -z "$HOSTING_PUBLIC" ]; then
-            # 기본값: web 프로젝트면 web/dist, 루트면 dist
             if [ "$UI_DIR" = "web" ]; then
               HOSTING_PUBLIC="web/dist"
             else
@@ -138,10 +156,8 @@ jobs:
             fi
             echo "hosting_public_not_found=1" >> "$GITHUB_OUTPUT"
           fi
-
           echo "hosting_public=$HOSTING_PUBLIC" >> "$GITHUB_OUTPUT"
 
-          # 2) hosting.public 경로에 빌드 산출물 동기화
           if [ "$BUILD_DIST" != "$HOSTING_PUBLIC" ]; then
             echo "[info] Copy build from $BUILD_DIST -> $HOSTING_PUBLIC"
             mkdir -p "$HOSTING_PUBLIC"
@@ -151,6 +167,5 @@ jobs:
             echo "[info] Build output already matches hosting.public ($HOSTING_PUBLIC)"
           fi
 
-      # ---- Deploy Hosting ----
       - name: Deploy Hosting
         run: firebase deploy --only hosting --project "$FIREBASE_PROJECT_ID" --non-interactive
