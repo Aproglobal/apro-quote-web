@@ -13,7 +13,6 @@ env:
 jobs:
   deploy:
     runs-on: ubuntu-24.04
-
     permissions:
       contents: write
       pull-requests: write
@@ -95,21 +94,23 @@ jobs:
             sed -i "s/\"default\": \".*\"/\"default\": \"$FIREBASE_PROJECT_ID\"/g" .firebaserc || true
           fi
 
-      # ---- Firestore rules ----
+      # ---- Firestore rules (있을 때만) ----
       - name: Deploy Firestore rules
+        if: ${{ hashFiles('firestore.rules') != '' }}
         run: firebase deploy --only firestore:rules --project "$FIREBASE_PROJECT_ID"
 
-      # ---- Secrets (functions) ----
+      # ---- Functions: 시크릿 갱신 & 배포(있을 때만) ----
       - name: Update OPENAI_API_KEY secret for Functions
         run: |
           printf '%s' "$OPENAI_API_KEY" | \
           firebase functions:secrets:set OPENAI_API_KEY --project "$FIREBASE_PROJECT_ID" --non-interactive
 
-      # ---- Functions build & deploy ----
-      - name: Build (root, if present)
+      - name: Build (root, only if package.json exists)
+        if: ${{ hashFiles('package.json') != '' }}
         run: npm run build --if-present
 
       - name: Deploy Cloud Functions
+        if: ${{ hashFiles('functions/package.json') != '' }}
         run: firebase deploy --only functions --project "$FIREBASE_PROJECT_ID" --non-interactive
 
       # ---- UI 디렉토리 자동 감지 (web/ 또는 .) ----
@@ -125,47 +126,4 @@ jobs:
             echo "No UI package.json found"; exit 1
           fi
 
-      # ---- UI deps 설치: lockfile 있으면 ci, 없으면 i ----
-      - name: Install deps (UI)
-        working-directory: ${{ steps.detect_ui.outputs.dir }}
-        run: |
-          if [ -f package-lock.json ]; then
-            npm ci --no-audit --progress=false
-          else
-            npm i  --no-audit --progress=false
-          fi
-
-      - name: Build (UI)
-        working-directory: ${{ steps.detect_ui.outputs.dir }}
-        run: npm run build
-
-      # ---- firebase.json hosting.public과 빌드 산출물 정렬 ----
-      - name: Normalize hosting public path
-        id: norm_hosting
-        shell: bash
-        run: |
-          HOSTING_PUBLIC=$(node -e "const f=require('fs');let p='';try{const j=JSON.parse(f.readFileSync('firebase.json','utf8'));if(j.hosting&&j.hosting.public)p=j.hosting.public;}catch{};process.stdout.write(p||'');")
-          UI_DIR="${{ steps.detect_ui.outputs.dir }}"
-          BUILD_DIST="$UI_DIR/dist"
-
-          if [ -z "$HOSTING_PUBLIC" ]; then
-            if [ "$UI_DIR" = "web" ]; then
-              HOSTING_PUBLIC="web/dist"
-            else
-              HOSTING_PUBLIC="dist"
-            fi
-            echo "hosting_public_not_found=1" >> "$GITHUB_OUTPUT"
-          fi
-          echo "hosting_public=$HOSTING_PUBLIC" >> "$GITHUB_OUTPUT"
-
-          if [ "$BUILD_DIST" != "$HOSTING_PUBLIC" ]; then
-            echo "[info] Copy build from $BUILD_DIST -> $HOSTING_PUBLIC"
-            mkdir -p "$HOSTING_PUBLIC"
-            rm -rf "$HOSTING_PUBLIC"/*
-            cp -r "$BUILD_DIST"/* "$HOSTING_PUBLIC"/
-          else
-            echo "[info] Build output already matches hosting.public ($HOSTING_PUBLIC)"
-          fi
-
-      - name: Deploy Hosting
-        run: firebase deploy --only hosting --project "$FIREBASE_PROJECT_ID" --non-interactive
+      #
