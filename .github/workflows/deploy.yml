@@ -99,18 +99,54 @@ jobs:
         if: ${{ hashFiles('firestore.rules') != '' }}
         run: firebase deploy --only firestore:rules --project "$FIREBASE_PROJECT_ID"
 
-      # ---- Functions: 시크릿 갱신 & 배포(있을 때만) ----
+      # ---- Functions: 시크릿 갱신 ----
       - name: Update OPENAI_API_KEY secret for Functions
         run: |
           printf '%s' "$OPENAI_API_KEY" | \
           firebase functions:secrets:set OPENAI_API_KEY --project "$FIREBASE_PROJECT_ID" --non-interactive
 
+      # ---- 루트 빌드 (루트에 package.json 있을 때만) ----
       - name: Build (root, only if package.json exists)
         if: ${{ hashFiles('package.json') != '' }}
         run: npm run build --if-present
 
-      - name: Deploy Cloud Functions
+      # ---- Functions 의존성 설치 (있을 때만) ----
+      - name: Install deps (functions)
         if: ${{ hashFiles('functions/package.json') != '' }}
+        working-directory: functions
+        run: |
+          if [ -f package-lock.json ]; then
+            npm ci --no-audit --progress=false
+          else
+            npm i  --no-audit --progress=false
+          fi
+
+      # ---- Functions 빌드 (build 스크립트 있으면 실행, 없으면 tsconfig로 컴파일) ----
+      - name: Build (functions)
+        if: ${{ hashFiles('functions/package.json') != '' }}
+        working-directory: functions
+        run: |
+          if npm run | grep -qE '^\s*build'; then
+            npm run build
+          elif [ -f tsconfig.json ]; then
+            npx tsc -p .
+          else
+            echo "No build script or tsconfig.json in functions/; skipping compile"
+          fi
+
+      # ---- Functions 산출물 확인 (lib/** 없으면 배포 스킵 안내) ----
+      - name: Verify functions output
+        if: ${{ hashFiles('functions/package.json') != '' }}
+        run: |
+          if [ -z "$(ls -1 functions/lib/*.js 2>/dev/null || true)" ]; then
+            echo "::warning::functions/lib/*.js not found. Cloud Functions deploy will be skipped."
+          else
+            echo "Found functions/lib JS output."
+          fi
+
+      # ---- Cloud Functions 배포 (package.json 있고, lib/** 있을 때만) ----
+      - name: Deploy Cloud Functions
+        if: ${{ hashFiles('functions/package.json') != '' && hashFiles('functions/lib/**') != '' }}
         run: firebase deploy --only functions --project "$FIREBASE_PROJECT_ID" --non-interactive
 
       # ---- UI 디렉토리 자동 감지 (web/ 또는 .) ----
@@ -126,4 +162,62 @@ jobs:
             echo "No UI package.json found"; exit 1
           fi
 
-      #
+      # ---- UI deps 설치: lockfile 있으면 ci, 없으면 i ----
+      - name: Install deps (UI)
+        working-directory: ${{ steps.detect_ui.outputs.dir }}
+        run: |
+          if [ -f package-lock.json ]; then
+            npm ci --no-audit --progress=false
+          else
+            npm i  --no-audit --progress=false
+          fi
+
+      - name: Build (UI)
+        working-directory: ${{ steps.detect_ui.outputs.dir }}
+        run: npm run build
+
+      # ---- firebase.json hosting.public과 빌드 산출물 정렬 ----
+      - name: Normalize hosting public path
+        id: norm_hosting
+        shell: bash
+        run: |
+          HOSTING_PUBLIC=$(node - <<'NODE'
+          const fs = require('fs');
+          let p='';
+          try {
+            const j = JSON.parse(fs.readFileSync('firebase.json','utf8'));
+            if (Array.isArray(j.hosting)) {
+              const h = j.hosting.find(h => h && h.public) || j.hosting[0];
+              if (h && h.public) p = h.public;
+            } else if (j.hosting && typeof j.hosting === 'object') {
+              p = j.hosting.public || '';
+            }
+          } catch {}
+          process.stdout.write(p);
+          NODE
+          )
+
+          UI_DIR="${{ steps.detect_ui.outputs.dir }}"
+          BUILD_DIST="$UI_DIR/dist"
+
+          if [ -z "$HOSTING_PUBLIC" ]; then
+            if [ "$UI_DIR" = "web" ]; then
+              HOSTING_PUBLIC="web/dist"
+            else
+              HOSTING_PUBLIC="dist"
+            fi
+            echo "hosting_public_not_found=1" >> "$GITHUB_OUTPUT"
+          fi
+          echo "hosting_public=$HOSTING_PUBLIC" >> "$GITHUB_OUTPUT"
+
+          if [ "$BUILD_DIST" != "$HOSTING_PUBLIC" ]; then
+            echo "[info] Copy build from $BUILD_DIST -> $HOSTING_PUBLIC"
+            mkdir -p "$HOSTING_PUBLIC"
+            rm -rf "$HOSTING_PUBLIC"/*
+            cp -r "$BUILD_DIST"/* "$HOSTING_PUBLIC"/
+          else
+            echo "[info] Build output already matches hosting.public ($HOSTING_PUBLIC)"
+          fi
+
+      - name: Deploy Hosting
+        run: firebase deploy --only hosting --project "$FIREBASE_PROJECT_ID" --non-interactive
