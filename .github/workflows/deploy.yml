@@ -1,52 +1,56 @@
-name: Deploy to Firebase (Hosting + Functions + Rules)
+name: deploy
 
 on:
   push:
-    branches: [ "main" ]
-  workflow_dispatch: {}
+    branches: [ main ]
+  workflow_dispatch:
 
-permissions:
-  contents: write
-  pull-requests: write
-
-concurrency:
-  group: deploy-${{ github.ref }}
-  cancel-in-progress: false
+env:
+  FIREBASE_PROJECT_ID: ${{ secrets.FIREBASE_PROJECT_ID }}
+  OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+  PR_TOKEN: ${{ secrets.PR_TOKEN }}
 
 jobs:
   deploy:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
 
-    env:
-      FIREBASE_PROJECT_ID: ${{ secrets.FIREBASE_PROJECT_ID }}
-      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-      PR_TOKEN: ${{ secrets.PR_TOKEN || secrets.GITHUB_TOKEN }}
+    permissions:
+      contents: write
+      pull-requests: write
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup Node
+      - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
           node-version: 20
+          cache: npm
+          cache-dependency-path: |
+            web/package-lock.json
+            functions/package-lock.json
 
-      - name: Authenticate to Google Cloud
+      # ---- GCP / Firebase ----
+      - name: Auth to Google Cloud
         uses: google-github-actions/auth@v2
         with:
           credentials_json: ${{ secrets.GCP_SA_KEY }}
           create_credentials_file: true
           export_environment_variables: true
+          cleanup_credentials: true
 
-      - name: Setup gcloud SDK
+      - name: Setup gcloud
         uses: google-github-actions/setup-gcloud@v2
         with:
           project_id: ${{ env.FIREBASE_PROJECT_ID }}
+          version: latest
 
       - name: Install Firebase CLI
         run: npm i -g firebase-tools@latest
 
-      - name: Enable required Google APIs
+      - name: Enable required GCP APIs
+        shell: bash
         run: |
           gcloud services enable \
             firebase.googleapis.com \
@@ -59,83 +63,79 @@ jobs:
             storage.googleapis.com \
             run.googleapis.com \
             eventarc.googleapis.com \
-            --project "${FIREBASE_PROJECT_ID}"
+            pubsub.googleapis.com \
+            --project "$FIREBASE_PROJECT_ID"
 
-      - name: Patch .firebaserc (optional)
+      - name: Patch .firebaserc default project (optional)
+        shell: bash
         run: |
           if [ -f ".firebaserc" ]; then
-            sed -i "s/\"default\": \".*\"/\"default\": \"${FIREBASE_PROJECT_ID}\"/g" .firebaserc || true
+            sed -i "s/\"default\": \".*\"/\"default\": \"$FIREBASE_PROJECT_ID\"/g" .firebaserc || true
           fi
 
-      # ---- Firestore Rules ----
-      - name: Deploy Firestore Rules
-        run: firebase deploy --only firestore:rules --project "${FIREBASE_PROJECT_ID}"
+      # ---- Firestore rules ----
+      - name: Deploy Firestore rules
+        run: firebase deploy --only firestore:rules --project "$FIREBASE_PROJECT_ID"
 
-      # ---- Secret for Functions ----
-      - name: Set Functions Secret (OPENAI_API_KEY)
-        if: ${{ env.OPENAI_API_KEY != '' }}
+      # ---- Secrets (functions) ----
+      - name: Update OPENAI_API_KEY secret for Functions
         run: |
-          printf '%s' "$OPENAI_API_KEY" | firebase functions:secrets:set OPENAI_API_KEY \
-            --project "$FIREBASE_PROJECT_ID" --non-interactive
+          printf '%s' "$OPENAI_API_KEY" | \
+          firebase functions:secrets:set OPENAI_API_KEY --project "$FIREBASE_PROJECT_ID" --non-interactive
 
-      # ---- Functions ----
-      - name: Install deps (functions)
-        working-directory: functions
-        run: |
-          if [ -f package-lock.json ]; then npm ci --no-audit --progress=false; else npm i; fi
-
-      - name: Build Functions
-        working-directory: functions
+      # ---- Functions build & deploy ----
+      # (프로젝트 루트의 tsc가 functions/lib를 빌드한다고 전제: 기존 로그와 동일)
+      - name: Build (root, if present)
         run: npm run build --if-present
 
-      - name: Deploy Functions
-        run: firebase deploy --only functions --project "${FIREBASE_PROJECT_ID}" --non-interactive
+      - name: Deploy Cloud Functions
+        run: firebase deploy --only functions --project "$FIREBASE_PROJECT_ID" --non-interactive
 
-      # ---- Web (Vite) ----
-      # 필요 UI deps 자동 추가: package.json 수정 시 의도적으로 종료코드 42
-      - name: Ensure UI deps (framer-motion, lucide-react)
+      # ---- Web: 의존성 자동 보강 (항상 0 종료) ----
+      - name: Ensure UI deps (web)
         id: ensure_ui_deps
         working-directory: web
-        continue-on-error: true
-        run: >
-          node -e "const fs=require('fs');const f='package.json';
-          const pkg=JSON.parse(fs.readFileSync(f,'utf8'));
-          const need={'framer-motion':'^11.2.10','lucide-react':'^0.460.0'};
-          let dirty=false;
-          for(const k in need){
-            const has=(pkg.dependencies&&pkg.dependencies[k])||(pkg.devDependencies&&pkg.devDependencies[k]);
-            if(!has){(pkg.dependencies=pkg.dependencies||{})[k]=need[k];dirty=true;console.log('[add]',k+'@'+need[k]);}
+        run: |
+          node - <<'NODE'
+          const fs = require('fs');
+          const f = 'package.json';
+          const need = { "framer-motion": "^11.2.10", "lucide-react": "^0.460.0" };
+          const pkg = JSON.parse(fs.readFileSync(f, 'utf8'));
+          let changed = false;
+          pkg.dependencies = pkg.dependencies || {};
+          for (const [k, v] of Object.entries(need)) {
+            if (!pkg.dependencies[k]) { pkg.dependencies[k] = v; changed = true; console.log('[add]', k+'@'+v); }
           }
-          if(dirty){fs.writeFileSync(f,JSON.stringify(pkg,null,2)+'\n');process.exit(42)}else{console.log('UI deps OK')}"
+          if (changed) fs.writeFileSync(f, JSON.stringify(pkg, null, 2) + '\n');
+          require('fs').appendFileSync(process.env.GITHUB_OUTPUT, `changed=${changed}\n`);
+          NODE
 
-      - name: Generate lockfile (only when deps added)
-        if: ${{ steps.ensure_ui_deps.outcome == 'failure' }}
+      - name: Update lockfile (web, only if deps changed)
+        if: steps.ensure_ui_deps.outputs.changed == 'true'
         working-directory: web
         run: npm i --package-lock-only --no-audit --progress=false
 
       - name: Install deps (web)
         working-directory: web
-        run: |
-          if [ -f package-lock.json ]; then npm ci --no-audit --progress=false; else npm i; fi
+        run: npm ci --no-audit --progress=false
 
-      - name: Build Web
+      - name: Build (web)
         working-directory: web
         run: npm run build
 
-      - name: Deploy Hosting
-        run: firebase deploy --only hosting --project "${FIREBASE_PROJECT_ID}" --non-interactive
+      - name: Deploy Hosting (web)
+        run: firebase deploy --only hosting --project "$FIREBASE_PROJECT_ID" --non-interactive
 
-      # ---- Optional: 자동 PR(조직 정책으로 막혀도 워크플로우 성공 유지) ----
-      - name: Create Pull Request for added UI deps (optional)
-        if: ${{ steps.ensure_ui_deps.outcome == 'failure' }}
-        continue-on-error: true
+      # ---- Create PR only when UI deps were added ----
+      - name: Create Pull Request for UI deps
+        if: steps.ensure_ui_deps.outputs.changed == 'true'
         uses: peter-evans/create-pull-request@v6
         with:
           token: ${{ env.PR_TOKEN }}
-          commit-message: "chore(web): add UI deps (framer-motion, lucide-react) [skip ci]"
-          title: "chore(web): add UI deps (framer-motion, lucide-react)"
+          commit-message: chore(web): add UI deps (framer-motion, lucide-react) [skip ci]
+          title: chore(web): add UI deps (framer-motion, lucide-react)
           body: |
-            CI가 web 빌드 중 필요한 UI 의존성을 감지하여 package.json과 lock 파일을 추가/갱신했습니다.
+            CI가 web 빌드 중 필요한 UI 의존성을 감지하여 package.json과 lock 파일을 갱신했습니다.
             - framer-motion
             - lucide-react
           labels: dependencies
