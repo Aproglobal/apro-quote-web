@@ -27,7 +27,9 @@ jobs:
         with:
           node-version: 20
           cache: npm
+          # 루트/웹/펑션즈 모두 캐시 고려
           cache-dependency-path: |
+            package-lock.json
             web/package-lock.json
             functions/package-lock.json
 
@@ -84,64 +86,71 @@ jobs:
           firebase functions:secrets:set OPENAI_API_KEY --project "$FIREBASE_PROJECT_ID" --non-interactive
 
       # ---- Functions build & deploy ----
-      # (프로젝트 루트의 tsc가 functions/lib를 빌드한다고 전제: 기존 로그와 동일)
       - name: Build (root, if present)
         run: npm run build --if-present
 
       - name: Deploy Cloud Functions
         run: firebase deploy --only functions --project "$FIREBASE_PROJECT_ID" --non-interactive
 
-      # ---- Web: 의존성 자동 보강 (항상 0 종료) ----
-      - name: Ensure UI deps (web)
-        id: ensure_ui_deps
-        working-directory: web
+      # ---- Detect UI directory (web/ or .) ----
+      - name: Detect UI dir
+        id: detect_ui
+        shell: bash
         run: |
-          node - <<'NODE'
-          const fs = require('fs');
-          const f = 'package.json';
-          const need = { "framer-motion": "^11.2.10", "lucide-react": "^0.460.0" };
-          const pkg = JSON.parse(fs.readFileSync(f, 'utf8'));
-          let changed = false;
-          pkg.dependencies = pkg.dependencies || {};
-          for (const [k, v] of Object.entries(need)) {
-            if (!pkg.dependencies[k]) { pkg.dependencies[k] = v; changed = true; console.log('[add]', k+'@'+v); }
-          }
-          if (changed) fs.writeFileSync(f, JSON.stringify(pkg, null, 2) + '\n');
-          require('fs').appendFileSync(process.env.GITHUB_OUTPUT, `changed=${changed}\n`);
-          NODE
+          if [ -f "web/package.json" ]; then
+            echo "dir=web" >> "$GITHUB_OUTPUT"
+          elif [ -f "package.json" ]; then
+            echo "dir=." >> "$GITHUB_OUTPUT"
+          else
+            echo "No UI package.json found"; exit 1
+          fi
 
-      - name: Update lockfile (web, only if deps changed)
-        if: steps.ensure_ui_deps.outputs.changed == 'true'
-        working-directory: web
-        run: npm i --package-lock-only --no-audit --progress=false
+      # ---- Install deps (lockfile 있으면 ci, 없으면 i) ----
+      - name: Install deps (UI)
+        working-directory: ${{ steps.detect_ui.outputs.dir }}
+        run: |
+          if [ -f package-lock.json ]; then
+            npm ci --no-audit --progress=false
+          else
+            npm i --no-audit --progress=false
+          fi
 
-      - name: Install deps (web)
-        working-directory: web
-        run: npm ci --no-audit --progress=false
-
-      - name: Build (web)
-        working-directory: web
+      - name: Build (UI)
+        working-directory: ${{ steps.detect_ui.outputs.dir }}
         run: npm run build
 
-      - name: Deploy Hosting (web)
-        run: firebase deploy --only hosting --project "$FIREBASE_PROJECT_ID" --non-interactive
+      # ---- Match build output to firebase.json hosting.public ----
+      - name: Normalize hosting public path
+        id: norm_hosting
+        shell: bash
+        run: |
+          # 1) firebase.json에서 hosting.public 읽기 (없으면 기본값 결정)
+          HOSTING_PUBLIC=$(node -e "const f=require('fs');let p='';try{const j=JSON.parse(f.readFileSync('firebase.json','utf8'));if(j.hosting&&j.hosting.public)p=j.hosting.public;}catch{};process.stdout.write(p||'');")
+          UI_DIR="${{ steps.detect_ui.outputs.dir }}"
+          BUILD_DIST="$UI_DIR/dist"
 
-      # ---- Create PR only when UI deps were added ----
-      - name: Create Pull Request for UI deps
-        if: steps.ensure_ui_deps.outputs.changed == 'true'
-        uses: peter-evans/create-pull-request@v6
-        with:
-          token: ${{ env.PR_TOKEN }}
-          commit-message: chore(web): add UI deps (framer-motion, lucide-react) [skip ci]
-          title: chore(web): add UI deps (framer-motion, lucide-react)
-          body: |
-            CI가 web 빌드 중 필요한 UI 의존성을 감지하여 package.json과 lock 파일을 갱신했습니다.
-            - framer-motion
-            - lucide-react
-          labels: dependencies
-          base: main
-          branch: chore/ui-deps
-          branch-suffix: timestamp
-          add-paths: |
-            web/package.json
-            web/package-lock.json
+          if [ -z "$HOSTING_PUBLIC" ]; then
+            # 기본값: web 프로젝트면 web/dist, 루트면 dist
+            if [ "$UI_DIR" = "web" ]; then
+              HOSTING_PUBLIC="web/dist"
+            else
+              HOSTING_PUBLIC="dist"
+            fi
+            echo "hosting_public_not_found=1" >> "$GITHUB_OUTPUT"
+          fi
+
+          echo "hosting_public=$HOSTING_PUBLIC" >> "$GITHUB_OUTPUT"
+
+          # 2) hosting.public 경로에 빌드 산출물 동기화
+          if [ "$BUILD_DIST" != "$HOSTING_PUBLIC" ]; then
+            echo "[info] Copy build from $BUILD_DIST -> $HOSTING_PUBLIC"
+            mkdir -p "$HOSTING_PUBLIC"
+            rm -rf "$HOSTING_PUBLIC"/*
+            cp -r "$BUILD_DIST"/* "$HOSTING_PUBLIC"/
+          else
+            echo "[info] Build output already matches hosting.public ($HOSTING_PUBLIC)"
+          fi
+
+      # ---- Deploy Hosting ----
+      - name: Deploy Hosting
+        run: firebase deploy --only hosting --project "$FIREBASE_PROJECT_ID" --non-interactive
